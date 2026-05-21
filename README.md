@@ -27,7 +27,9 @@ The mock demonstrates:
 5. PunchOut basket building with normal checkout replaced by a return-basket action.
 6. A generated `PunchOutOrderMessage`.
 7. Auto-posting the basket back to the procurement `BrowserFormPost` URL.
-8. A procurement return page that displays the received cXML.
+8. A procurement return page that displays the received cXML as a pending requisition.
+9. ERP approval that converts the returned basket into a cXML `OrderRequest`.
+10. A supplier order endpoint/inbox that receives the approved order from the ERP.
 
 Mock session and basket state is stored in the browser's PHP session for this demo.
 
@@ -52,3 +54,28 @@ The demo setup succeeds only when these values match:
 4. ERP shared secret matches supplier shared secret.
 
 Change one side only, then try to punch out from a product. The supplier returns `401 Unauthorized` and no `StartPage` URL. Set both sides back to matching values, or use the reset button, and the flow works again.
+
+### Mock approval flow
+
+After the basket is returned to the ERP, the return page shows an approval action.
+
+Click:
+
+```text
+Approve and send PO to supplier
+```
+
+The ERP then:
+
+1. Reads the returned `PunchOutOrderMessage`.
+2. Creates an approved purchase order as cXML `OrderRequest`.
+3. Sends that order message to the supplier side.
+4. Shows the supplier's cXML response.
+
+The supplier-side inbox is available at:
+
+```text
+http://localhost:8000/supplier/orders
+```
+
+That page shows the approved `OrderRequest` messages the mock supplier has received.

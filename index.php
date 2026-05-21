@@ -44,6 +44,7 @@ $products = [
 
 $_SESSION['punchout_sessions'] ??= [];
 $_SESSION['returned_orders'] ??= [];
+$_SESSION['supplier_orders'] ??= [];
 $_SESSION['erp_config'] ??= [
     'buyer_identity' => 'DEMO_BUYER',
     'supplier_identity' => 'MOCK_SUPPLIER',
@@ -107,6 +108,38 @@ function firstXmlValue(string $xml, string $xpath): string
     }
 
     return trim((string) $result[0]);
+}
+
+function loadXml(string $xml): ?SimpleXMLElement
+{
+    libxml_use_internal_errors(true);
+    $doc = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NONET);
+
+    return $doc ?: null;
+}
+
+function validateSupplierCredentials(string $xml, array $supplierConfig): array
+{
+    $buyerIdentity = firstXmlValue($xml, '//Header/From/Credential/Identity');
+    $supplierIdentity = firstXmlValue($xml, '//Header/To/Credential/Identity');
+    $senderIdentity = firstXmlValue($xml, '//Sender/Credential/Identity');
+    $sharedSecret = firstXmlValue($xml, '//Sender/Credential/SharedSecret');
+    $failures = [];
+
+    if ($buyerIdentity !== $supplierConfig['expected_buyer_identity']) {
+        $failures[] = 'From Identity does not match the supplier expected buyer identity.';
+    }
+    if ($supplierIdentity !== $supplierConfig['supplier_identity']) {
+        $failures[] = 'To Identity does not match the supplier identity.';
+    }
+    if ($senderIdentity !== $supplierConfig['expected_sender_identity']) {
+        $failures[] = 'Sender Identity does not match the supplier expected sender identity.';
+    }
+    if ($sharedSecret !== $supplierConfig['shared_secret']) {
+        $failures[] = 'SharedSecret does not match.';
+    }
+
+    return $failures;
 }
 
 function page(string $content, string $area = 'erp'): string
@@ -366,23 +399,7 @@ function setupResponseXml(string $sessionId, string $baseUrl): string
 function createPunchoutSessionFromXml(string $xml, string $baseUrl, array $supplierConfig): array
 {
     $buyerIdentity = firstXmlValue($xml, '//Header/From/Credential/Identity');
-    $supplierIdentity = firstXmlValue($xml, '//Header/To/Credential/Identity');
-    $senderIdentity = firstXmlValue($xml, '//Sender/Credential/Identity');
-    $sharedSecret = firstXmlValue($xml, '//Sender/Credential/SharedSecret');
-    $failures = [];
-
-    if ($buyerIdentity !== $supplierConfig['expected_buyer_identity']) {
-        $failures[] = 'From Identity does not match the supplier expected buyer identity.';
-    }
-    if ($supplierIdentity !== $supplierConfig['supplier_identity']) {
-        $failures[] = 'To Identity does not match the supplier identity.';
-    }
-    if ($senderIdentity !== $supplierConfig['expected_sender_identity']) {
-        $failures[] = 'Sender Identity does not match the supplier expected sender identity.';
-    }
-    if ($sharedSecret !== $supplierConfig['shared_secret']) {
-        $failures[] = 'SharedSecret does not match.';
-    }
+    $failures = validateSupplierCredentials($xml, $supplierConfig);
 
     if ($failures) {
         return [
@@ -479,6 +496,154 @@ function orderMessageXml(array $session, array $products): string
 </cXML>';
 }
 
+function punchoutOrderLines(string $cxml): array
+{
+    $doc = loadXml($cxml);
+    if (!$doc) {
+        return [];
+    }
+
+    $lines = [];
+    foreach ($doc->xpath('//PunchOutOrderMessage/ItemIn') ?: [] as $item) {
+        $lines[] = [
+            'quantity' => (string) ($item['quantity'] ?? '1'),
+            'supplier_part_id' => trim((string) ($item->ItemID->SupplierPartID ?? '')),
+            'description' => trim((string) ($item->ItemDetail->Description ?? '')),
+            'unit_price' => trim((string) ($item->ItemDetail->UnitPrice->Money ?? '0.00')),
+            'currency' => isset($item->ItemDetail->UnitPrice->Money['currency'])
+                ? trim((string) $item->ItemDetail->UnitPrice->Money['currency'])
+                : 'GBP',
+            'uom' => trim((string) ($item->ItemDetail->UnitOfMeasure ?? 'EA')),
+            'classification' => trim((string) ($item->ItemDetail->Classification ?? '')),
+        ];
+    }
+
+    return $lines;
+}
+
+function orderRequestXml(array $returnedOrder, array $erpConfig): string
+{
+    $orderId = 'PO-' . date('Ymd-His') . '-' . substr($returnedOrder['id'], 0, 8);
+    $buyerCookie = firstXmlValue($returnedOrder['cxml'], '//PunchOutOrderMessage/BuyerCookie');
+    $total = firstXmlValue($returnedOrder['cxml'], '//PunchOutOrderMessageHeader/Total/Money') ?: '0.00';
+    $currency = 'GBP';
+    $doc = loadXml($returnedOrder['cxml']);
+    if ($doc) {
+        $money = $doc->xpath('//PunchOutOrderMessageHeader/Total/Money');
+        if ($money && isset($money[0]['currency'])) {
+            $currency = (string) $money[0]['currency'];
+        }
+    }
+
+    $items = '';
+    foreach (punchoutOrderLines($returnedOrder['cxml']) as $index => $line) {
+        $lineNumber = $index + 1;
+        $items .= '    <ItemOut quantity="' . x($line['quantity']) . '" lineNumber="' . $lineNumber . '">
+      <ItemID>
+        <SupplierPartID>' . x($line['supplier_part_id']) . '</SupplierPartID>
+      </ItemID>
+      <ItemDetail>
+        <UnitPrice>
+          <Money currency="' . x($line['currency']) . '">' . x($line['unit_price']) . '</Money>
+        </UnitPrice>
+        <Description xml:lang="en">' . x($line['description']) . '</Description>
+        <UnitOfMeasure>' . x($line['uom']) . '</UnitOfMeasure>
+        <Classification domain="UNSPSC">' . x($line['classification']) . '</Classification>
+      </ItemDetail>
+    </ItemOut>
+';
+    }
+
+    return '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
+<cXML payloadID="' . x(uuid() . '@mock-procurement') . '" timestamp="' . x(date(DATE_ATOM)) . '">
+  <Header>
+    <From>
+      <Credential domain="NetworkId">
+        <Identity>' . x($erpConfig['buyer_identity']) . '</Identity>
+      </Credential>
+    </From>
+    <To>
+      <Credential domain="NetworkId">
+        <Identity>' . x($erpConfig['supplier_identity']) . '</Identity>
+      </Credential>
+    </To>
+    <Sender>
+      <Credential domain="NetworkId">
+        <Identity>' . x($erpConfig['sender_identity']) . '</Identity>
+        <SharedSecret>' . x($erpConfig['shared_secret']) . '</SharedSecret>
+      </Credential>
+      <UserAgent>Mock ERP Order Sender</UserAgent>
+    </Sender>
+  </Header>
+  <Request deploymentMode="test">
+    <OrderRequest>
+      <OrderRequestHeader orderID="' . x($orderId) . '" orderDate="' . x(date(DATE_ATOM)) . '" type="new">
+        <Total>
+          <Money currency="' . x($currency) . '">' . x($total) . '</Money>
+        </Total>
+        <ShipTo>
+          <Address isoCountryCode="GB" addressID="MAIN-WAREHOUSE">
+            <Name xml:lang="en">Demo Procurement Co</Name>
+            <PostalAddress>
+              <Street>1 Procurement Way</Street>
+              <City>Manchester</City>
+              <PostalCode>M1 1AA</PostalCode>
+              <Country isoCountryCode="GB">United Kingdom</Country>
+            </PostalAddress>
+          </Address>
+        </ShipTo>
+        <Extrinsic name="BuyerCookie">' . x($buyerCookie) . '</Extrinsic>
+      </OrderRequestHeader>
+' . $items . '    </OrderRequest>
+  </Request>
+</cXML>';
+}
+
+function supplierOrderResponseXml(string $orderRequestXml, array $failures): string
+{
+    $ok = !$failures;
+    $statusCode = $ok ? '200' : '401';
+    $statusText = $ok ? 'OK' : 'Unauthorized';
+    $message = $ok ? 'OrderRequest received by supplier' : implode(' ', $failures);
+
+    return '<?xml version="1.0" encoding="UTF-8"?>
+<cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
+  <Response>
+    <Status code="' . $statusCode . '" text="' . x($statusText) . '">' . x($message) . '</Status>
+  </Response>
+</cXML>';
+}
+
+function receiveSupplierOrderRequest(string $xml, array $supplierConfig): array
+{
+    $failures = validateSupplierCredentials($xml, $supplierConfig);
+    $responseXml = supplierOrderResponseXml($xml, $failures);
+
+    if ($failures) {
+        return [
+            'ok' => false,
+            'status' => 401,
+            'xml' => $responseXml,
+            'failures' => $failures,
+        ];
+    }
+
+    $orderId = firstXmlValue($xml, '//OrderRequestHeader/@orderID') ?: 'UNKNOWN';
+    $_SESSION['supplier_orders'][$orderId] = [
+        'id' => $orderId,
+        'cxml' => $xml,
+        'created_at' => date('d/m/Y H:i:s'),
+    ];
+
+    return [
+        'ok' => true,
+        'status' => 200,
+        'xml' => $responseXml,
+        'order_id' => $orderId,
+    ];
+}
+
 function procurementHome(array $products): string
 {
     $cards = '';
@@ -500,8 +665,14 @@ function procurementHome(array $products): string
     }
 
     $latest = $_SESSION['returned_orders'][0] ?? null;
+    $approveAction = $latest && ($latest['status'] ?? 'pending') === 'pending'
+        ? '<form method="post" action="/procurement/orders/' . h($latest['id']) . '/approve">
+            <button type="submit" class="ok">Approve and send PO</button>
+          </form>'
+        : '';
+    $orderStatus = $latest ? '<div class="meta">Status: ' . h($latest['status'] ?? 'pending') . '</div>' : '';
     $returned = $latest
-        ? '<div class="callout"><strong>Last return:</strong> ' . h($latest['created_at']) . '</div><pre>' . h($latest['cxml']) . '</pre>'
+        ? '<div class="callout"><strong>Last return:</strong> ' . h($latest['created_at']) . '</div>' . $orderStatus . $approveAction . '<pre>' . h($latest['cxml']) . '</pre>'
         : '<div class="empty">No PunchOutOrderMessage has been returned yet.</div>';
 
     return '
@@ -633,6 +804,95 @@ function setupExchangePage(string $setupXml, array $result): string
     </div>';
 }
 
+function returnedOrderPage(array $returnedOrder): string
+{
+    $approveAction = ($returnedOrder['status'] ?? 'pending') === 'pending'
+        ? '<form method="post" action="/procurement/orders/' . h($returnedOrder['id']) . '/approve">
+            <button type="submit" class="ok">Approve and send PO to supplier</button>
+          </form>'
+        : '<a class="button" href="/supplier/orders">View supplier order inbox</a>';
+
+    return '
+    <div class="grid">
+      <section class="stack">
+        <h1>Basket returned</h1>
+        <p>The ERP received the PunchOutOrderMessage. In a real flow this is now a requisition waiting for buyer approval.</p>
+        <div class="callout"><strong>Validation:</strong> BuyerCookie, item lines, quantities, unit prices, currency, UOM, and classifications are visible in the returned cXML.</div>
+        ' . $approveAction . '
+        <a class="button secondary" href="/">Back to procurement search</a>
+      </section>
+      <aside class="panel stack">
+        <h2>Received cXML</h2>
+        <div class="meta">Status: ' . h($returnedOrder['status'] ?? 'pending') . '</div>
+        <pre>' . h($returnedOrder['cxml']) . '</pre>
+      </aside>
+    </div>';
+}
+
+function orderApprovalPage(array $returnedOrder): string
+{
+    $ok = ($returnedOrder['supplier_response_ok'] ?? false) === true;
+    $statusClass = $ok ? 'status-ok' : 'status-error';
+    $statusText = $ok
+        ? 'Supplier accepted the approved OrderRequest.'
+        : 'Supplier rejected the OrderRequest. Check the setup values on both sides.';
+
+    return '
+    <div class="grid">
+      <section class="stack">
+        <h1>Order approved</h1>
+        <p>The ERP converted the returned PunchOut basket into an approved purchase order and sent a cXML OrderRequest to the supplier.</p>
+        <div class="callout ' . $statusClass . '"><strong>Supplier response:</strong> ' . h($statusText) . '</div>
+        <a class="button" href="/supplier/orders">View supplier order inbox</a>
+        <a class="button secondary" href="/">Back to ERP search</a>
+      </section>
+      <aside class="stack">
+        <div class="panel stack">
+          <h2>OrderRequest sent</h2>
+          <pre>' . h($returnedOrder['order_request_cxml'] ?? '') . '</pre>
+        </div>
+        <div class="panel stack">
+          <h2>Supplier response</h2>
+          <pre>' . h($returnedOrder['supplier_response_cxml'] ?? '') . '</pre>
+        </div>
+      </aside>
+    </div>';
+}
+
+function supplierOrdersPage(): string
+{
+    if (!$_SESSION['supplier_orders']) {
+        return '
+    <div class="stack">
+      <div>
+        <h1>Supplier order inbox</h1>
+        <p>Approved ERP OrderRequest messages will appear here after the buyer approves a returned basket.</p>
+      </div>
+      <div class="empty">No approved orders have been received yet.</div>
+      <a class="button secondary" href="/">Back to ERP search</a>
+    </div>';
+    }
+
+    $orders = '';
+    foreach (array_reverse($_SESSION['supplier_orders']) as $order) {
+        $orders .= '<section class="panel stack supplier-panel">
+          <h2>' . h($order['id']) . '</h2>
+          <div class="meta">Received: ' . h($order['created_at']) . '</div>
+          <pre>' . h($order['cxml']) . '</pre>
+        </section>';
+    }
+
+    return '
+    <div class="stack">
+      <div>
+        <h1>Supplier order inbox</h1>
+        <p>This is the supplier side receiving the approved cXML OrderRequest from the ERP.</p>
+        <a class="button secondary" href="/">Back to ERP search</a>
+      </div>
+      ' . $orders . '
+    </div>';
+}
+
 function storefront(array $session, array $products): string
 {
     $selected = findProduct($products, $session['selected_sku']);
@@ -685,6 +945,7 @@ function storefront(array $session, array $products): string
           <h1>Supplier storefront</h1>
           <p>PunchOut mode is active. The buyer can build a basket here, then return it to procurement instead of checking out.</p>
           <a class="button secondary" href="/admin">PunchOut setup admin</a>
+          <a class="button secondary" href="/supplier/orders">Supplier order inbox</a>
         </div>
         <div class="products">' . $productCards . '</div>
       </section>
@@ -806,23 +1067,48 @@ if ($method === 'POST' && $path === '/cxml/punchout/setup') {
 
 if ($method === 'POST' && $path === '/procurement/return') {
     $cxml = (string) ($_POST['cXML-urlencoded'] ?? '');
-    array_unshift($_SESSION['returned_orders'], [
+    $returnedOrder = [
+        'id' => uuid(),
         'cxml' => $cxml,
+        'status' => 'pending',
         'created_at' => date('d/m/Y H:i:s'),
-    ]);
-    sendHtml('
-    <div class="grid">
-      <section class="stack">
-        <h1>Basket returned</h1>
-        <p>The procurement system received the PunchOutOrderMessage and can now turn the basket into a requisition.</p>
-        <div class="callout"><strong>Validation:</strong> BuyerCookie, item lines, quantities, unit prices, currency, UOM, and classifications are visible in the returned cXML.</div>
-        <a class="button" href="/">Back to procurement search</a>
-      </section>
-      <aside class="panel stack">
-        <h2>Received cXML</h2>
-        <pre>' . h($cxml) . '</pre>
-      </aside>
-    </div>');
+    ];
+    array_unshift($_SESSION['returned_orders'], $returnedOrder);
+    sendHtml(returnedOrderPage($returnedOrder));
+    return;
+}
+
+if ($method === 'POST' && preg_match('#^/procurement/orders/([a-f0-9-]+)/approve$#', $path, $matches)) {
+    foreach ($_SESSION['returned_orders'] as $index => $returnedOrder) {
+        if ($returnedOrder['id'] !== $matches[1]) {
+            continue;
+        }
+
+        $orderRequestXml = orderRequestXml($returnedOrder, $_SESSION['erp_config']);
+        $supplierResponse = receiveSupplierOrderRequest($orderRequestXml, $_SESSION['supplier_config']);
+        $_SESSION['returned_orders'][$index]['status'] = $supplierResponse['ok'] ? 'approved and sent' : 'approval send failed';
+        $_SESSION['returned_orders'][$index]['order_request_cxml'] = $orderRequestXml;
+        $_SESSION['returned_orders'][$index]['supplier_response_cxml'] = $supplierResponse['xml'];
+        $_SESSION['returned_orders'][$index]['supplier_response_ok'] = $supplierResponse['ok'];
+
+        sendHtml(orderApprovalPage($_SESSION['returned_orders'][$index]));
+        return;
+    }
+
+    http_response_code(404);
+    echo 'Returned order not found';
+    return;
+}
+
+if ($method === 'GET' && $path === '/supplier/orders') {
+    sendHtml(supplierOrdersPage(), 'supplier');
+    return;
+}
+
+if ($method === 'POST' && $path === '/supplier/cxml/order') {
+    $xml = file_get_contents('php://input') ?: '';
+    $result = receiveSupplierOrderRequest($xml, $_SESSION['supplier_config']);
+    sendXml($result['xml'], $result['status']);
     return;
 }
 
