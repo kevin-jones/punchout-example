@@ -31,7 +31,23 @@ The mock demonstrates:
 9. ERP approval that converts the returned basket into a cXML `OrderRequest`.
 10. A supplier order endpoint/inbox that receives the approved order from the ERP.
 
-Mock session and basket state is stored in the browser's PHP session for this demo.
+Mock session and basket state is stored in a local `mock-state.json` file for this demo.
+
+When using ngrok, post external tester requests to:
+
+```text
+https://your-ngrok-host/cxml/punchout/setup
+```
+
+The mock derives its `StartPage` URL from the incoming request host, so a request through ngrok should return:
+
+```text
+https://your-ngrok-host/supplier/start/...
+```
+
+Do not set `BASE_URL=http://localhost:8000` when testing through ngrok. If `BASE_URL` is set, it overrides automatic host detection.
+
+Runtime mock state is stored in `mock-state.json` so server-to-server cXML setup requests and browser redirects can share the same PunchOut session.
 
 ### Mock setup admin
 

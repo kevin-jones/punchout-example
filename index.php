@@ -4,7 +4,8 @@ declare(strict_types=1);
 
 session_start();
 
-$baseUrl = getenv('BASE_URL') ?: 'http://localhost:8000';
+$statePath = __DIR__ . '/mock-state.json';
+$baseUrl = getenv('BASE_URL') ?: currentBaseUrl();
 
 $products = [
     [
@@ -42,22 +43,61 @@ $products = [
     ],
 ];
 
-$_SESSION['punchout_sessions'] ??= [];
-$_SESSION['returned_orders'] ??= [];
-$_SESSION['supplier_orders'] ??= [];
-$_SESSION['erp_config'] ??= [
-    'buyer_identity' => 'DEMO_BUYER',
-    'supplier_identity' => 'MOCK_SUPPLIER',
-    'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
-    'shared_secret' => 'topsecret',
-    'browser_form_post_url' => $baseUrl . '/procurement/return',
-];
-$_SESSION['supplier_config'] ??= [
-    'expected_buyer_identity' => 'DEMO_BUYER',
-    'supplier_identity' => 'MOCK_SUPPLIER',
-    'expected_sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
-    'shared_secret' => 'topsecret',
-];
+$state = loadState($statePath, $baseUrl);
+
+function currentBaseUrl(): string
+{
+    $scheme = $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? null;
+    if (!$scheme) {
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    }
+
+    $host = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? ($_SERVER['HTTP_HOST'] ?? 'localhost:8000');
+
+    return $scheme . '://' . $host;
+}
+
+function defaultState(string $baseUrl): array
+{
+    return [
+        'punchout_sessions' => [],
+        'returned_orders' => [],
+        'supplier_orders' => [],
+        'erp_config' => [
+            'buyer_identity' => 'DEMO_BUYER',
+            'supplier_identity' => 'MOCK_SUPPLIER',
+            'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
+            'shared_secret' => 'topsecret',
+            'browser_form_post_url' => $baseUrl . '/procurement/return',
+        ],
+        'supplier_config' => [
+            'expected_buyer_identity' => 'DEMO_BUYER',
+            'supplier_identity' => 'MOCK_SUPPLIER',
+            'expected_sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
+            'shared_secret' => 'topsecret',
+        ],
+    ];
+}
+
+function loadState(string $statePath, string $baseUrl): array
+{
+    $defaults = defaultState($baseUrl);
+    if (!is_file($statePath)) {
+        return $defaults;
+    }
+
+    $loaded = json_decode((string) file_get_contents($statePath), true);
+    if (!is_array($loaded)) {
+        return $defaults;
+    }
+
+    return array_replace_recursive($defaults, $loaded);
+}
+
+function saveState(string $statePath, array $state): void
+{
+    file_put_contents($statePath, json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), LOCK_EX);
+}
 
 function h(string|int|float|null $value): string
 {
@@ -384,6 +424,7 @@ function setupRequestXml(array $product, array $erpConfig): string
 function setupResponseXml(string $sessionId, string $baseUrl): string
 {
     return '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
 <cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
   <Response>
     <Status code="200" text="OK">PunchOut session created</Status>
@@ -396,7 +437,7 @@ function setupResponseXml(string $sessionId, string $baseUrl): string
 </cXML>';
 }
 
-function createPunchoutSessionFromXml(string $xml, string $baseUrl, array $supplierConfig): array
+function createPunchoutSessionFromXml(string $xml, string $baseUrl, array $supplierConfig, array &$state): array
 {
     $buyerIdentity = firstXmlValue($xml, '//Header/From/Credential/Identity');
     $failures = validateSupplierCredentials($xml, $supplierConfig);
@@ -405,6 +446,7 @@ function createPunchoutSessionFromXml(string $xml, string $baseUrl, array $suppl
         return [
             'ok' => false,
             'xml' => '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
 <cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
   <Response>
     <Status code="401" text="Unauthorized">' . x(implode(' ', $failures)) . '</Status>
@@ -416,7 +458,7 @@ function createPunchoutSessionFromXml(string $xml, string $baseUrl, array $suppl
     }
 
     $sessionId = uuid();
-    $_SESSION['punchout_sessions'][$sessionId] = [
+    $state['punchout_sessions'][$sessionId] = [
         'id' => $sessionId,
         'buyer_cookie' => firstXmlValue($xml, '//PunchOutSetupRequest/BuyerCookie'),
         'browser_form_post_url' => firstXmlValue($xml, '//PunchOutSetupRequest/BrowserFormPost/URL'),
@@ -608,6 +650,7 @@ function supplierOrderResponseXml(string $orderRequestXml, array $failures): str
     $message = $ok ? 'OrderRequest received by supplier' : implode(' ', $failures);
 
     return '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
 <cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
   <Response>
     <Status code="' . $statusCode . '" text="' . x($statusText) . '">' . x($message) . '</Status>
@@ -615,7 +658,7 @@ function supplierOrderResponseXml(string $orderRequestXml, array $failures): str
 </cXML>';
 }
 
-function receiveSupplierOrderRequest(string $xml, array $supplierConfig): array
+function receiveSupplierOrderRequest(string $xml, array $supplierConfig, array &$state): array
 {
     $failures = validateSupplierCredentials($xml, $supplierConfig);
     $responseXml = supplierOrderResponseXml($xml, $failures);
@@ -630,7 +673,7 @@ function receiveSupplierOrderRequest(string $xml, array $supplierConfig): array
     }
 
     $orderId = firstXmlValue($xml, '//OrderRequestHeader/@orderID') ?: 'UNKNOWN';
-    $_SESSION['supplier_orders'][$orderId] = [
+    $state['supplier_orders'][$orderId] = [
         'id' => $orderId,
         'cxml' => $xml,
         'created_at' => date('d/m/Y H:i:s'),
@@ -644,7 +687,7 @@ function receiveSupplierOrderRequest(string $xml, array $supplierConfig): array
     ];
 }
 
-function procurementHome(array $products): string
+function procurementHome(array $products, array $state): string
 {
     $cards = '';
     foreach ($products as $product) {
@@ -664,7 +707,7 @@ function procurementHome(array $products): string
     </div>';
     }
 
-    $latest = $_SESSION['returned_orders'][0] ?? null;
+    $latest = $state['returned_orders'][0] ?? null;
     $approveAction = $latest && ($latest['status'] ?? 'pending') === 'pending'
         ? '<form method="post" action="/procurement/orders/' . h($latest['id']) . '/approve">
             <button type="submit" class="ok">Approve and send PO</button>
@@ -859,9 +902,9 @@ function orderApprovalPage(array $returnedOrder): string
     </div>';
 }
 
-function supplierOrdersPage(): string
+function supplierOrdersPage(array $state): string
 {
-    if (!$_SESSION['supplier_orders']) {
+    if (!$state['supplier_orders']) {
         return '
     <div class="stack">
       <div>
@@ -874,7 +917,7 @@ function supplierOrdersPage(): string
     }
 
     $orders = '';
-    foreach (array_reverse($_SESSION['supplier_orders']) as $order) {
+    foreach (array_reverse($state['supplier_orders']) as $order) {
         $orders .= '<section class="panel stack supplier-panel">
           <h2>' . h($order['id']) . '</h2>
           <div class="meta">Received: ' . h($order['created_at']) . '</div>
@@ -1000,67 +1043,75 @@ $method = $_SERVER['REQUEST_METHOD'];
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 
 if ($method === 'GET' && $path === '/') {
-    sendHtml(procurementHome($products));
+    sendHtml(procurementHome($products, $state));
     return;
 }
 
 if ($method === 'GET' && $path === '/admin') {
-    sendHtml(adminPage($_SESSION['erp_config'], $_SESSION['supplier_config'], (string) ($_GET['saved'] ?? '')));
+    sendHtml(adminPage($state['erp_config'], $state['supplier_config'], (string) ($_GET['saved'] ?? '')));
     return;
 }
 
 if ($method === 'POST' && $path === '/admin/erp') {
-    $_SESSION['erp_config'] = [
+    $state['erp_config'] = [
         'buyer_identity' => trim((string) ($_POST['buyer_identity'] ?? '')),
         'supplier_identity' => trim((string) ($_POST['supplier_identity'] ?? '')),
         'sender_identity' => trim((string) ($_POST['sender_identity'] ?? '')),
         'shared_secret' => trim((string) ($_POST['shared_secret'] ?? '')),
         'browser_form_post_url' => trim((string) ($_POST['browser_form_post_url'] ?? '')) ?: $baseUrl . '/procurement/return',
     ];
+    saveState($statePath, $state);
     redirectTo('/admin?saved=ERP setup values updated');
     return;
 }
 
 if ($method === 'POST' && $path === '/admin/supplier') {
-    $_SESSION['supplier_config'] = [
+    $state['supplier_config'] = [
         'expected_buyer_identity' => trim((string) ($_POST['expected_buyer_identity'] ?? '')),
         'supplier_identity' => trim((string) ($_POST['supplier_identity'] ?? '')),
         'expected_sender_identity' => trim((string) ($_POST['expected_sender_identity'] ?? '')),
         'shared_secret' => trim((string) ($_POST['shared_secret'] ?? '')),
     ];
+    saveState($statePath, $state);
     redirectTo('/admin?saved=Supplier setup values updated');
     return;
 }
 
 if ($method === 'POST' && $path === '/admin/reset') {
-    $_SESSION['erp_config'] = [
+    $state['erp_config'] = [
         'buyer_identity' => 'DEMO_BUYER',
         'supplier_identity' => 'MOCK_SUPPLIER',
         'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
         'shared_secret' => 'topsecret',
         'browser_form_post_url' => $baseUrl . '/procurement/return',
     ];
-    $_SESSION['supplier_config'] = [
+    $state['supplier_config'] = [
         'expected_buyer_identity' => 'DEMO_BUYER',
         'supplier_identity' => 'MOCK_SUPPLIER',
         'expected_sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
         'shared_secret' => 'topsecret',
     ];
+    $state['punchout_sessions'] = [];
+    $state['returned_orders'] = [];
+    $state['supplier_orders'] = [];
+    saveState($statePath, $state);
     redirectTo('/admin?saved=Demo credentials reset');
     return;
 }
 
 if ($method === 'POST' && $path === '/procurement/punchout') {
     $product = findProduct($products, (string) ($_POST['sku'] ?? 'SKU-001'));
-    $setupXml = setupRequestXml($product, $_SESSION['erp_config']);
-    $result = createPunchoutSessionFromXml($setupXml, $baseUrl, $_SESSION['supplier_config']);
+    $setupXml = setupRequestXml($product, $state['erp_config']);
+    $result = createPunchoutSessionFromXml($setupXml, $baseUrl, $state['supplier_config'], $state);
+    saveState($statePath, $state);
     sendHtml(setupExchangePage($setupXml, $result));
     return;
 }
 
 if ($method === 'POST' && $path === '/cxml/punchout/setup') {
     $xml = file_get_contents('php://input') ?: '';
-    $result = createPunchoutSessionFromXml($xml, $baseUrl, $_SESSION['supplier_config']);
+    $result = createPunchoutSessionFromXml($xml, $baseUrl, $state['supplier_config'], $state);
+    saveState($statePath, $state);
     sendXml($result['xml'], $result['status']);
     return;
 }
@@ -1073,25 +1124,27 @@ if ($method === 'POST' && $path === '/procurement/return') {
         'status' => 'pending',
         'created_at' => date('d/m/Y H:i:s'),
     ];
-    array_unshift($_SESSION['returned_orders'], $returnedOrder);
+    array_unshift($state['returned_orders'], $returnedOrder);
+    saveState($statePath, $state);
     sendHtml(returnedOrderPage($returnedOrder));
     return;
 }
 
 if ($method === 'POST' && preg_match('#^/procurement/orders/([a-f0-9-]+)/approve$#', $path, $matches)) {
-    foreach ($_SESSION['returned_orders'] as $index => $returnedOrder) {
+    foreach ($state['returned_orders'] as $index => $returnedOrder) {
         if ($returnedOrder['id'] !== $matches[1]) {
             continue;
         }
 
-        $orderRequestXml = orderRequestXml($returnedOrder, $_SESSION['erp_config']);
-        $supplierResponse = receiveSupplierOrderRequest($orderRequestXml, $_SESSION['supplier_config']);
-        $_SESSION['returned_orders'][$index]['status'] = $supplierResponse['ok'] ? 'approved and sent' : 'approval send failed';
-        $_SESSION['returned_orders'][$index]['order_request_cxml'] = $orderRequestXml;
-        $_SESSION['returned_orders'][$index]['supplier_response_cxml'] = $supplierResponse['xml'];
-        $_SESSION['returned_orders'][$index]['supplier_response_ok'] = $supplierResponse['ok'];
+        $orderRequestXml = orderRequestXml($returnedOrder, $state['erp_config']);
+        $supplierResponse = receiveSupplierOrderRequest($orderRequestXml, $state['supplier_config'], $state);
+        $state['returned_orders'][$index]['status'] = $supplierResponse['ok'] ? 'approved and sent' : 'approval send failed';
+        $state['returned_orders'][$index]['order_request_cxml'] = $orderRequestXml;
+        $state['returned_orders'][$index]['supplier_response_cxml'] = $supplierResponse['xml'];
+        $state['returned_orders'][$index]['supplier_response_ok'] = $supplierResponse['ok'];
+        saveState($statePath, $state);
 
-        sendHtml(orderApprovalPage($_SESSION['returned_orders'][$index]));
+        sendHtml(orderApprovalPage($state['returned_orders'][$index]));
         return;
     }
 
@@ -1101,19 +1154,20 @@ if ($method === 'POST' && preg_match('#^/procurement/orders/([a-f0-9-]+)/approve
 }
 
 if ($method === 'GET' && $path === '/supplier/orders') {
-    sendHtml(supplierOrdersPage(), 'supplier');
+    sendHtml(supplierOrdersPage($state), 'supplier');
     return;
 }
 
 if ($method === 'POST' && $path === '/supplier/cxml/order') {
     $xml = file_get_contents('php://input') ?: '';
-    $result = receiveSupplierOrderRequest($xml, $_SESSION['supplier_config']);
+    $result = receiveSupplierOrderRequest($xml, $state['supplier_config'], $state);
+    saveState($statePath, $state);
     sendXml($result['xml'], $result['status']);
     return;
 }
 
 if ($method === 'GET' && preg_match('#^/supplier/start/([a-f0-9-]+)$#', $path, $matches)) {
-    if (!isset($_SESSION['punchout_sessions'][$matches[1]])) {
+    if (!isset($state['punchout_sessions'][$matches[1]])) {
         http_response_code(404);
         echo 'Session not found';
         return;
@@ -1124,7 +1178,7 @@ if ($method === 'GET' && preg_match('#^/supplier/start/([a-f0-9-]+)$#', $path, $
 }
 
 if ($method === 'GET' && preg_match('#^/supplier/session/([a-f0-9-]+)$#', $path, $matches)) {
-    $session = $_SESSION['punchout_sessions'][$matches[1]] ?? null;
+    $session = $state['punchout_sessions'][$matches[1]] ?? null;
     if (!$session) {
         http_response_code(404);
         echo 'Session not found';
@@ -1137,7 +1191,7 @@ if ($method === 'GET' && preg_match('#^/supplier/session/([a-f0-9-]+)$#', $path,
 
 if ($method === 'POST' && preg_match('#^/supplier/session/([a-f0-9-]+)/basket/add$#', $path, $matches)) {
     $sessionId = $matches[1];
-    if (!isset($_SESSION['punchout_sessions'][$sessionId])) {
+    if (!isset($state['punchout_sessions'][$sessionId])) {
         http_response_code(404);
         echo 'Session not found';
         return;
@@ -1145,22 +1199,26 @@ if ($method === 'POST' && preg_match('#^/supplier/session/([a-f0-9-]+)/basket/ad
 
     $sku = (string) ($_POST['sku'] ?? '');
     $quantity = max(1, (int) ($_POST['quantity'] ?? 1));
-    $basket = &$_SESSION['punchout_sessions'][$sessionId]['basket'];
+    $basket = &$state['punchout_sessions'][$sessionId]['basket'];
     foreach ($basket as &$line) {
         if ($line['sku'] === $sku) {
             $line['quantity'] += $quantity;
+            unset($line);
+            saveState($statePath, $state);
             redirectTo('/supplier/session/' . $sessionId);
             return;
         }
     }
+    unset($line);
 
     $basket[] = ['sku' => $sku, 'quantity' => $quantity];
+    saveState($statePath, $state);
     redirectTo('/supplier/session/' . $sessionId);
     return;
 }
 
 if ($method === 'POST' && preg_match('#^/supplier/session/([a-f0-9-]+)/return$#', $path, $matches)) {
-    $session = $_SESSION['punchout_sessions'][$matches[1]] ?? null;
+    $session = $state['punchout_sessions'][$matches[1]] ?? null;
     if (!$session) {
         http_response_code(404);
         echo 'Session not found';
