@@ -60,21 +60,21 @@ function currentBaseUrl(): string
 function defaultState(string $baseUrl): array
 {
     return [
-        'punchout_sessions' => [],
         'returned_orders' => [],
-        'supplier_orders' => [],
         'erp_config' => [
             'buyer_identity' => 'DEMO_BUYER',
-            'supplier_identity' => 'MOCK_SUPPLIER',
+            'supplier_identity' => 'REAL_WEBSTORE',
             'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
             'shared_secret' => 'topsecret',
+            'user_name' => 'Jamie Buyer',
+            'user_email' => 'buyer@example.test',
             'browser_form_post_url' => $baseUrl . '/procurement/return',
         ],
-        'supplier_config' => [
-            'expected_buyer_identity' => 'DEMO_BUYER',
-            'supplier_identity' => 'MOCK_SUPPLIER',
-            'expected_sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
-            'shared_secret' => 'topsecret',
+        'webstore_config' => [
+            'supplier_webstore_url' => getenv('SUPPLIER_WEBSTORE_URL') ?: '',
+            'punchout_setup_url' => getenv('WEBSTORE_PUNCHOUT_SETUP_URL') ?: '',
+            'order_request_url' => getenv('WEBSTORE_ORDER_REQUEST_URL') ?: '',
+            'request_timeout_seconds' => 15,
         ],
     ];
 }
@@ -156,30 +156,6 @@ function loadXml(string $xml): ?SimpleXMLElement
     $doc = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NONET);
 
     return $doc ?: null;
-}
-
-function validateSupplierCredentials(string $xml, array $supplierConfig): array
-{
-    $buyerIdentity = firstXmlValue($xml, '//Header/From/Credential/Identity');
-    $supplierIdentity = firstXmlValue($xml, '//Header/To/Credential/Identity');
-    $senderIdentity = firstXmlValue($xml, '//Sender/Credential/Identity');
-    $sharedSecret = firstXmlValue($xml, '//Sender/Credential/SharedSecret');
-    $failures = [];
-
-    if ($buyerIdentity !== $supplierConfig['expected_buyer_identity']) {
-        $failures[] = 'From Identity does not match the supplier expected buyer identity.';
-    }
-    if ($supplierIdentity !== $supplierConfig['supplier_identity']) {
-        $failures[] = 'To Identity does not match the supplier identity.';
-    }
-    if ($senderIdentity !== $supplierConfig['expected_sender_identity']) {
-        $failures[] = 'Sender Identity does not match the supplier expected sender identity.';
-    }
-    if ($sharedSecret !== $supplierConfig['shared_secret']) {
-        $failures[] = 'SharedSecret does not match.';
-    }
-
-    return $failures;
 }
 
 function page(string $content, string $area = 'erp'): string
@@ -267,7 +243,7 @@ function page(string $content, string $area = 'erp'): string
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .stack { display: grid; gap: 14px; }
     label { display: grid; gap: 6px; font-size: 13px; font-weight: 650; color: var(--ink); }
-    input[type="number"], input[type="text"], input[type="url"], input[type="password"] {
+    input[type="number"], input[type="text"], input[type="email"], input[type="url"], input[type="password"] {
       width: 82px;
       min-height: 38px;
       border: 1px solid var(--line);
@@ -276,7 +252,7 @@ function page(string $content, string $area = 'erp'): string
       font: inherit;
       background: #fff;
     }
-    input[type="text"], input[type="url"], input[type="password"] {
+    input[type="text"], input[type="email"], input[type="url"], input[type="password"] {
       width: 100%;
     }
     .form-grid { display: grid; gap: 12px; }
@@ -361,16 +337,82 @@ function sendHtml(string $content, string $area = 'erp'): void
     echo page($content, $area);
 }
 
-function sendXml(string $xml, int $status = 200): void
-{
-    http_response_code($status);
-    header('Content-Type: text/xml; charset=utf-8');
-    echo $xml;
-}
-
 function redirectTo(string $path): void
 {
     header('Location: ' . $path, true, 303);
+}
+
+function derivedWebstoreEndpoint(string $supplierWebstoreUrl, string $path): string
+{
+    $supplierWebstoreUrl = rtrim(trim($supplierWebstoreUrl), '/');
+    if ($supplierWebstoreUrl === '') {
+        return '';
+    }
+
+    return $supplierWebstoreUrl . $path;
+}
+
+function effectiveWebstoreConfig(array $webstoreConfig): array
+{
+    $supplierWebstoreUrl = trim((string) ($webstoreConfig['supplier_webstore_url'] ?? ''));
+    $setupUrl = trim((string) ($webstoreConfig['punchout_setup_url'] ?? ''));
+    $orderUrl = trim((string) ($webstoreConfig['order_request_url'] ?? ''));
+
+    return [
+        'supplier_webstore_url' => $supplierWebstoreUrl,
+        'punchout_setup_url' => $setupUrl ?: derivedWebstoreEndpoint($supplierWebstoreUrl, '/cxml/punchout/setup'),
+        'order_request_url' => $orderUrl ?: derivedWebstoreEndpoint($supplierWebstoreUrl, '/cxml/order'),
+        'request_timeout_seconds' => max(1, (int) ($webstoreConfig['request_timeout_seconds'] ?? 15)),
+    ];
+}
+
+function postCxml(string $url, string $xml, int $timeoutSeconds): array
+{
+    if ($url === '') {
+        return [
+            'ok' => false,
+            'status' => 0,
+            'body' => '',
+            'error' => 'No webstore endpoint is configured.',
+        ];
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'POST',
+            'header' => "Content-Type: text/xml; charset=utf-8\r\nAccept: text/xml, application/xml, */*\r\n",
+            'content' => $xml,
+            'ignore_errors' => true,
+            'timeout' => max(1, $timeoutSeconds),
+        ],
+    ]);
+
+    $body = @file_get_contents($url, false, $context);
+    if ($body === false) {
+        $error = error_get_last();
+
+        return [
+            'ok' => false,
+            'status' => 0,
+            'body' => '',
+            'error' => $error['message'] ?? 'The webstore request failed.',
+        ];
+    }
+
+    $status = 0;
+    foreach ($http_response_header ?? [] as $header) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $header, $matches)) {
+            $status = (int) $matches[1];
+            break;
+        }
+    }
+
+    return [
+        'ok' => $status >= 200 && $status < 300,
+        'status' => $status,
+        'body' => $body,
+        'error' => '',
+    ];
 }
 
 function setupRequestXml(array $product, array $erpConfig): string
@@ -408,8 +450,8 @@ function setupRequestXml(array $product, array $erpConfig): string
         <URL>' . x($returnUrl) . '</URL>
       </BrowserFormPost>
       <Contact role="endUser">
-        <Name xml:lang="en">Jamie Buyer</Name>
-        <Email>buyer@example.test</Email>
+        <Name xml:lang="en">' . x($erpConfig['user_name'] ?? '') . '</Name>
+        <Email>' . x($erpConfig['user_email'] ?? '') . '</Email>
       </Contact>
       <SelectedItem>
         <ItemID>
@@ -421,121 +463,9 @@ function setupRequestXml(array $product, array $erpConfig): string
 </cXML>';
 }
 
-function setupResponseXml(string $sessionId, string $baseUrl): string
-{
-    return '<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
-<cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
-  <Response>
-    <Status code="200" text="OK">PunchOut session created</Status>
-    <PunchOutSetupResponse>
-      <StartPage>
-        <URL>' . x($baseUrl . '/supplier/start/' . $sessionId) . '</URL>
-      </StartPage>
-    </PunchOutSetupResponse>
-  </Response>
-</cXML>';
-}
-
-function createPunchoutSessionFromXml(string $xml, string $baseUrl, array $supplierConfig, array &$state): array
-{
-    $buyerIdentity = firstXmlValue($xml, '//Header/From/Credential/Identity');
-    $failures = validateSupplierCredentials($xml, $supplierConfig);
-
-    if ($failures) {
-        return [
-            'ok' => false,
-            'xml' => '<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
-<cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
-  <Response>
-    <Status code="401" text="Unauthorized">' . x(implode(' ', $failures)) . '</Status>
-  </Response>
-</cXML>',
-            'status' => 401,
-            'failures' => $failures,
-        ];
-    }
-
-    $sessionId = uuid();
-    $state['punchout_sessions'][$sessionId] = [
-        'id' => $sessionId,
-        'buyer_cookie' => firstXmlValue($xml, '//PunchOutSetupRequest/BuyerCookie'),
-        'browser_form_post_url' => firstXmlValue($xml, '//PunchOutSetupRequest/BrowserFormPost/URL'),
-        'buyer_identity' => $buyerIdentity ?: 'DEMO_BUYER',
-        'selected_sku' => firstXmlValue($xml, '//PunchOutSetupRequest/SelectedItem/ItemID/SupplierPartID') ?: 'SKU-001',
-        'basket' => [],
-        'created_at' => date(DATE_ATOM),
-    ];
-
-    return [
-        'ok' => true,
-        'session_id' => $sessionId,
-        'xml' => setupResponseXml($sessionId, $baseUrl),
-        'status' => 200,
-    ];
-}
-
 function parseStartUrl(string $responseXml): string
 {
     return firstXmlValue($responseXml, '//PunchOutSetupResponse/StartPage/URL');
-}
-
-function basketTotal(array $session, array $products): float
-{
-    $total = 0.0;
-    foreach ($session['basket'] as $line) {
-        $product = findProduct($products, $line['sku']);
-        $total += $product['price'] * $line['quantity'];
-    }
-
-    return $total;
-}
-
-function orderMessageXml(array $session, array $products): string
-{
-    $lines = '';
-    foreach ($session['basket'] as $index => $line) {
-        $product = findProduct($products, $line['sku']);
-        $lineNumber = $index + 1;
-        $lines .= '    <ItemIn quantity="' . x((string) $line['quantity']) . '">
-      <ItemID>
-        <SupplierPartID>' . x($product['sku']) . '</SupplierPartID>
-      </ItemID>
-      <ItemDetail>
-        <UnitPrice>
-          <Money currency="' . x($product['currency']) . '">' . money($product['price']) . '</Money>
-        </UnitPrice>
-        <Description xml:lang="en">' . x($product['name']) . '</Description>
-        <UnitOfMeasure>' . x($product['uom']) . '</UnitOfMeasure>
-        <Classification domain="UNSPSC">' . x($product['classification']) . '</Classification>
-      </ItemDetail>
-      <Distribution>
-        <Accounting name="lineNumber">
-          <AccountingSegment id="' . $lineNumber . '">
-            <Name xml:lang="en">Line ' . $lineNumber . '</Name>
-            <Description xml:lang="en">' . x($product['category']) . '</Description>
-          </AccountingSegment>
-        </Accounting>
-      </Distribution>
-    </ItemIn>
-';
-    }
-
-    return '<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
-<cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
-  <Message deploymentMode="test">
-    <PunchOutOrderMessage>
-      <BuyerCookie>' . x($session['buyer_cookie']) . '</BuyerCookie>
-      <PunchOutOrderMessageHeader operationAllowed="edit">
-        <Total>
-          <Money currency="GBP">' . money(basketTotal($session, $products)) . '</Money>
-        </Total>
-      </PunchOutOrderMessageHeader>
-' . $lines . '    </PunchOutOrderMessage>
-  </Message>
-</cXML>';
 }
 
 function punchoutOrderLines(string $cxml): array
@@ -642,51 +572,6 @@ function orderRequestXml(array $returnedOrder, array $erpConfig): string
 </cXML>';
 }
 
-function supplierOrderResponseXml(string $orderRequestXml, array $failures): string
-{
-    $ok = !$failures;
-    $statusCode = $ok ? '200' : '401';
-    $statusText = $ok ? 'OK' : 'Unauthorized';
-    $message = $ok ? 'OrderRequest received by supplier' : implode(' ', $failures);
-
-    return '<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
-<cXML payloadID="' . x(uuid() . '@mock-supplier') . '" timestamp="' . x(date(DATE_ATOM)) . '">
-  <Response>
-    <Status code="' . $statusCode . '" text="' . x($statusText) . '">' . x($message) . '</Status>
-  </Response>
-</cXML>';
-}
-
-function receiveSupplierOrderRequest(string $xml, array $supplierConfig, array &$state): array
-{
-    $failures = validateSupplierCredentials($xml, $supplierConfig);
-    $responseXml = supplierOrderResponseXml($xml, $failures);
-
-    if ($failures) {
-        return [
-            'ok' => false,
-            'status' => 401,
-            'xml' => $responseXml,
-            'failures' => $failures,
-        ];
-    }
-
-    $orderId = firstXmlValue($xml, '//OrderRequestHeader/@orderID') ?: 'UNKNOWN';
-    $state['supplier_orders'][$orderId] = [
-        'id' => $orderId,
-        'cxml' => $xml,
-        'created_at' => date('d/m/Y H:i:s'),
-    ];
-
-    return [
-        'ok' => true,
-        'status' => 200,
-        'xml' => $responseXml,
-        'order_id' => $orderId,
-    ];
-}
-
 function procurementHome(array $products, array $state): string
 {
     $cards = '';
@@ -723,7 +608,7 @@ function procurementHome(array $products, array $state): string
       <section class="stack">
         <div>
           <h1>Procurement search results</h1>
-          <p>Clicking a result sends a mock cXML PunchOutSetupRequest and opens the supplier storefront on the selected Level 2 item.</p>
+          <p>Clicking a result sends a cXML PunchOutSetupRequest to the configured webstore and opens the returned StartPage URL.</p>
           <a class="button secondary" href="/admin">PunchOut setup admin</a>
         </div>
         <div class="products">' . $cards . '</div>
@@ -735,25 +620,22 @@ function procurementHome(array $products, array $state): string
     </div>';
 }
 
-function adminPage(array $erpConfig, array $supplierConfig, string $message = ''): string
+function adminPage(array $erpConfig, array $webstoreConfig, string $message = ''): string
 {
     $status = $message ? '<div class="callout status-ok"><strong>Saved:</strong> ' . h($message) . '</div>' : '';
-    $matches = [
-        'Buyer identity' => $erpConfig['buyer_identity'] === $supplierConfig['expected_buyer_identity'],
-        'Supplier identity' => $erpConfig['supplier_identity'] === $supplierConfig['supplier_identity'],
-        'Sender identity' => $erpConfig['sender_identity'] === $supplierConfig['expected_sender_identity'],
-        'Shared secret' => $erpConfig['shared_secret'] === $supplierConfig['shared_secret'],
-    ];
-    $matchRows = '';
-    foreach ($matches as $label => $ok) {
-        $matchRows .= '<tr><td>' . h($label) . '</td><td>' . ($ok ? 'Matches' : 'Mismatch') . '</td></tr>';
-    }
+    $effectiveWebstoreConfig = effectiveWebstoreConfig($webstoreConfig);
+    $supplierWebstoreUrl = (string) ($webstoreConfig['supplier_webstore_url'] ?? '');
+    $setupUrl = (string) ($webstoreConfig['punchout_setup_url'] ?? '');
+    $orderUrl = (string) ($webstoreConfig['order_request_url'] ?? '');
+    $effectiveSetupUrl = (string) ($effectiveWebstoreConfig['punchout_setup_url'] ?? '');
+    $effectiveOrderUrl = (string) ($effectiveWebstoreConfig['order_request_url'] ?? '');
+    $timeout = (int) ($effectiveWebstoreConfig['request_timeout_seconds'] ?? 15);
 
     return '
     <div class="stack">
       <div>
         <h1>PunchOut setup admin</h1>
-        <p>Edit the values the ERP sends and the values the supplier storefront expects. The PunchOut setup step only succeeds when the identities and shared secret match.</p>
+        <p>Configure the ERP identities and the real webstore endpoints used for PunchOut setup and approved purchase orders.</p>
         <a class="button secondary" href="/">Back to ERP search</a>
       </div>
       ' . $status . '
@@ -774,6 +656,12 @@ function adminPage(array $erpConfig, array $supplierConfig, string $message = ''
             <label>Shared secret sent by ERP
               <input type="text" name="shared_secret" value="' . h($erpConfig['shared_secret']) . '">
             </label>
+            <label>End user name
+              <input type="text" name="user_name" value="' . h($erpConfig['user_name'] ?? '') . '">
+            </label>
+            <label>End user email
+              <input type="email" name="user_email" value="' . h($erpConfig['user_email'] ?? '') . '" placeholder="buyer@example.com">
+            </label>
             <label>BrowserFormPost return URL
               <input type="url" name="browser_form_post_url" value="' . h($erpConfig['browser_form_post_url']) . '">
             </label>
@@ -781,33 +669,39 @@ function adminPage(array $erpConfig, array $supplierConfig, string $message = ''
           </form>
         </section>
         <section class="panel stack supplier-panel">
-          <h2>Supplier expected values</h2>
-          <p>These are checked before the supplier creates a PunchOut session.</p>
-          <form method="post" action="/admin/supplier" class="form-grid">
-            <label>Expected buyer identity
-              <input type="text" name="expected_buyer_identity" value="' . h($supplierConfig['expected_buyer_identity']) . '">
+          <h2>Webstore endpoints</h2>
+          <p>Set the supplier webstore base URL, or override the exact cXML endpoints if your routes differ.</p>
+          <form method="post" action="/admin/webstore" class="form-grid">
+            <label>Supplier webstore base URL
+              <input type="url" name="supplier_webstore_url" value="' . h($supplierWebstoreUrl) . '" placeholder="https://store.example.test">
             </label>
-            <label>Supplier identity
-              <input type="text" name="supplier_identity" value="' . h($supplierConfig['supplier_identity']) . '">
+            <label>PunchOut setup URL override
+              <input type="url" name="punchout_setup_url" value="' . h($setupUrl) . '" placeholder="https://store.example.test/cxml/punchout/setup">
             </label>
-            <label>Expected sender identity
-              <input type="text" name="expected_sender_identity" value="' . h($supplierConfig['expected_sender_identity']) . '">
+            <label>OrderRequest URL override
+              <input type="url" name="order_request_url" value="' . h($orderUrl) . '" placeholder="https://store.example.test/cxml/order">
             </label>
-            <label>Shared secret expected by supplier
-              <input type="text" name="shared_secret" value="' . h($supplierConfig['shared_secret']) . '">
+            <label>Request timeout seconds
+              <input type="number" name="request_timeout_seconds" value="' . h((string) $timeout) . '" min="1">
             </label>
-            <button type="submit" class="ok">Save supplier values</button>
+            <button type="submit" class="ok">Save webstore endpoints</button>
           </form>
         </section>
       </div>
       <section class="panel stack">
-        <h2>Current compatibility check</h2>
+        <h2>ERP return endpoint</h2>
+        <p>Set the BrowserFormPost URL to a public URL for this app when the real webstore is not running on the same machine. With ngrok, this is usually <code>https://your-ngrok-host/procurement/return</code>.</p>
         <table>
-          <thead><tr><th>Field</th><th>Status</th></tr></thead>
-          <tbody>' . $matchRows . '</tbody>
+          <tbody>
+            <tr><th>BrowserFormPost URL</th><td>' . h($erpConfig['browser_form_post_url']) . '</td></tr>
+            <tr><th>End user</th><td>' . h(($erpConfig['user_name'] ?? '') . ' <' . ($erpConfig['user_email'] ?? '') . '>') . '</td></tr>
+            <tr><th>Supplier webstore URL</th><td>' . ($supplierWebstoreUrl === '' ? 'Not configured' : h($supplierWebstoreUrl)) . '</td></tr>
+            <tr><th>Effective PunchOut setup URL</th><td>' . ($effectiveSetupUrl === '' ? 'Not configured' : h($effectiveSetupUrl)) . '</td></tr>
+            <tr><th>Effective OrderRequest URL</th><td>' . ($effectiveOrderUrl === '' ? 'Not configured' : h($effectiveOrderUrl)) . '</td></tr>
+          </tbody>
         </table>
         <form method="post" action="/admin/reset">
-          <button type="submit" class="secondary">Reset demo credentials</button>
+          <button type="submit" class="secondary">Reset ERP defaults</button>
         </form>
       </section>
     </div>';
@@ -815,22 +709,25 @@ function adminPage(array $erpConfig, array $supplierConfig, string $message = ''
 
 function setupExchangePage(string $setupXml, array $result): string
 {
-    $responseXml = $result['xml'];
+    $responseXml = (string) ($result['body'] ?? '');
     $startUrl = parseStartUrl($responseXml);
-    $statusClass = $result['ok'] ? 'status-ok' : 'status-error';
-    $statusText = $result['ok']
-        ? 'Supplier accepted the setup request and created a StartPage URL.'
-        : 'Supplier rejected the setup request. Check the admin values on both sides.';
-    $primaryAction = $result['ok']
-        ? '<a class="button" href="' . h($startUrl) . '">Open supplier StartPage</a>'
-        : '<a class="button" href="/admin">Fix setup values</a>';
+    $statusClass = ($result['ok'] ?? false) && $startUrl !== '' ? 'status-ok' : 'status-error';
+    $httpStatus = (int) ($result['status'] ?? 0);
+    $error = (string) ($result['error'] ?? '');
+    $statusText = (($result['ok'] ?? false) && $startUrl !== '')
+        ? 'The webstore accepted the setup request and returned a StartPage URL.'
+        : 'The webstore did not return a usable PunchOutSetupResponse.';
+    $detail = $httpStatus ? 'HTTP ' . $httpStatus : ($error ?: 'No HTTP response');
+    $primaryAction = (($result['ok'] ?? false) && $startUrl !== '')
+        ? '<a class="button" href="' . h($startUrl) . '">Open webstore StartPage</a>'
+        : '<a class="button" href="/admin">Fix endpoint settings</a>';
 
     return '
     <div class="grid">
       <section class="stack">
         <h1>PunchOut setup exchanged</h1>
-        <p>The procurement harness generated cXML and the supplier setup handler validated it against the supplier-side setup values.</p>
-        <div class="callout ' . $statusClass . '"><strong>Setup result:</strong> ' . h($statusText) . '</div>
+        <p>The ERP generated cXML and posted it to the configured webstore PunchOut setup URL.</p>
+        <div class="callout ' . $statusClass . '"><strong>Setup result:</strong> ' . h($statusText) . '<br><span class="meta">' . h($detail) . '</span></div>
         ' . $primaryAction . '
         <a class="button secondary" href="/">Cancel</a>
       </section>
@@ -851,9 +748,9 @@ function returnedOrderPage(array $returnedOrder): string
 {
     $approveAction = ($returnedOrder['status'] ?? 'pending') === 'pending'
         ? '<form method="post" action="/procurement/orders/' . h($returnedOrder['id']) . '/approve">
-            <button type="submit" class="ok">Approve and send PO to supplier</button>
+            <button type="submit" class="ok">Approve and send PO to webstore</button>
           </form>'
-        : '<a class="button" href="/supplier/orders">View supplier order inbox</a>';
+        : '<div class="callout status-ok"><strong>Order status:</strong> ' . h($returnedOrder['status'] ?? '') . '</div>';
 
     return '
     <div class="grid">
@@ -877,16 +774,17 @@ function orderApprovalPage(array $returnedOrder): string
     $ok = ($returnedOrder['supplier_response_ok'] ?? false) === true;
     $statusClass = $ok ? 'status-ok' : 'status-error';
     $statusText = $ok
-        ? 'Supplier accepted the approved OrderRequest.'
-        : 'Supplier rejected the OrderRequest. Check the setup values on both sides.';
+        ? 'The webstore accepted the approved OrderRequest.'
+        : 'The webstore rejected the OrderRequest or did not respond successfully.';
+    $httpStatus = (int) ($returnedOrder['supplier_response_status'] ?? 0);
+    $detail = $httpStatus ? 'HTTP ' . $httpStatus : ((string) ($returnedOrder['supplier_response_error'] ?? 'No HTTP response'));
 
     return '
     <div class="grid">
       <section class="stack">
         <h1>Order approved</h1>
-        <p>The ERP converted the returned PunchOut basket into an approved purchase order and sent a cXML OrderRequest to the supplier.</p>
-        <div class="callout ' . $statusClass . '"><strong>Supplier response:</strong> ' . h($statusText) . '</div>
-        <a class="button" href="/supplier/orders">View supplier order inbox</a>
+        <p>The ERP converted the returned PunchOut basket into an approved purchase order and sent a cXML OrderRequest to the configured webstore endpoint.</p>
+        <div class="callout ' . $statusClass . '"><strong>Webstore response:</strong> ' . h($statusText) . '<br><span class="meta">' . h($detail) . '</span></div>
         <a class="button secondary" href="/">Back to ERP search</a>
       </section>
       <aside class="stack">
@@ -895,148 +793,11 @@ function orderApprovalPage(array $returnedOrder): string
           <pre>' . h($returnedOrder['order_request_cxml'] ?? '') . '</pre>
         </div>
         <div class="panel stack">
-          <h2>Supplier response</h2>
+          <h2>Webstore response</h2>
           <pre>' . h($returnedOrder['supplier_response_cxml'] ?? '') . '</pre>
         </div>
       </aside>
     </div>';
-}
-
-function supplierOrdersPage(array $state): string
-{
-    if (!$state['supplier_orders']) {
-        return '
-    <div class="stack">
-      <div>
-        <h1>Supplier order inbox</h1>
-        <p>Approved ERP OrderRequest messages will appear here after the buyer approves a returned basket.</p>
-      </div>
-      <div class="empty">No approved orders have been received yet.</div>
-      <a class="button secondary" href="/">Back to ERP search</a>
-    </div>';
-    }
-
-    $orders = '';
-    foreach (array_reverse($state['supplier_orders']) as $order) {
-        $orders .= '<section class="panel stack supplier-panel">
-          <h2>' . h($order['id']) . '</h2>
-          <div class="meta">Received: ' . h($order['created_at']) . '</div>
-          <pre>' . h($order['cxml']) . '</pre>
-        </section>';
-    }
-
-    return '
-    <div class="stack">
-      <div>
-        <h1>Supplier order inbox</h1>
-        <p>This is the supplier side receiving the approved cXML OrderRequest from the ERP.</p>
-        <a class="button secondary" href="/">Back to ERP search</a>
-      </div>
-      ' . $orders . '
-    </div>';
-}
-
-function storefront(array $session, array $products): string
-{
-    $selected = findProduct($products, $session['selected_sku']);
-    $productCards = '';
-    foreach ($products as $product) {
-        $defaultQty = $product['sku'] === $selected['sku'] ? 2 : 1;
-        $productCards .= '
-    <div class="card">
-      <div class="swatch" style="background:' . h($product['accent']) . '"></div>
-      <h3>' . h($product['name']) . '</h3>
-      <div class="meta">' . h($product['category']) . ' &middot; ' . h($product['sku']) . ' &middot; ' . h($product['uom']) . '</div>
-      <p>' . h($product['description']) . '</p>
-      <div class="price">' . h($product['currency']) . ' ' . money($product['price']) . '</div>
-      <form method="post" action="/supplier/session/' . h($session['id']) . '/basket/add" class="row">
-        <input type="hidden" name="sku" value="' . h($product['sku']) . '">
-        <label class="row">Qty <input type="number" name="quantity" value="' . $defaultQty . '" min="1"></label>
-        <button type="submit">Add</button>
-      </form>
-    </div>';
-    }
-
-    $basket = '<div class="empty">Basket is empty.</div>';
-    if ($session['basket']) {
-        $rows = '';
-        foreach ($session['basket'] as $line) {
-            $product = findProduct($products, $line['sku']);
-            $rows .= '<tr>
-      <td>' . h($product['sku']) . '</td>
-      <td>' . h($product['name']) . '</td>
-      <td>' . h((string) $line['quantity']) . '</td>
-      <td>' . h($product['currency']) . ' ' . money($product['price'] * $line['quantity']) . '</td>
-    </tr>';
-        }
-        $basket = '
-          <table>
-            <thead><tr><th>SKU</th><th>Item</th><th>Qty</th><th>Total</th></tr></thead>
-            <tbody>' . $rows . '</tbody>
-          </table>
-          <div class="total">GBP ' . money(basketTotal($session, $products)) . '</div>
-          <form method="post" action="/supplier/session/' . h($session['id']) . '/return">
-            <button type="submit" class="ok">Return basket</button>
-          </form>';
-    }
-
-    return '
-    <div class="grid">
-      <section class="stack">
-        <div class="callout"><strong>Auto signed in:</strong> Jamie Buyer landed on ' . h($selected['name']) . ' from the Level 2 SelectedItem.</div>
-        <div>
-          <h1>Supplier storefront</h1>
-          <p>PunchOut mode is active. The buyer can build a basket here, then return it to procurement instead of checking out.</p>
-          <a class="button secondary" href="/admin">PunchOut setup admin</a>
-          <a class="button secondary" href="/supplier/orders">Supplier order inbox</a>
-        </div>
-        <div class="products">' . $productCards . '</div>
-      </section>
-      <aside class="panel stack">
-        <h2>PunchOut basket</h2>
-        <div class="meta">BuyerCookie: ' . h($session['buyer_cookie']) . '</div>
-        ' . $basket . '
-        <a class="button secondary" href="/">Back to procurement</a>
-      </aside>
-    </div>';
-}
-
-function autoPostPage(string $returnUrl, string $cxml): string
-{
-    return '<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Returning basket</title>
-  <style>
-    body { margin: 0; font-family: system-ui, sans-serif; background: #eef2f8; color: #172033; }
-    header { background: #0f5f5c; color: #fff; border-bottom: 1px solid rgba(0,0,0,.24); }
-    .bar { max-width: 1180px; margin: 0 auto; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-    .brand { font-weight: 750; font-size: 18px; }
-    .pill { border: 1px solid rgba(255,255,255,.24); border-radius: 999px; padding: 6px 10px; color: #d8f7f5; font-size: 13px; white-space: nowrap; }
-    main { max-width: 720px; margin: 12vh auto; background: #fff; border: 1px solid #d9dee8; border-radius: 8px; padding: 24px; }
-    button { min-height: 38px; border: 1px solid #066f50; border-radius: 6px; background: #087f5b; color: #fff; padding: 8px 12px; font: inherit; font-weight: 650; }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="bar">
-      <div class="brand">Mock cXML PunchOut Level 2</div>
-      <div class="pill">Supplier shop &middot; Buyer: Demo Procurement Co</div>
-    </div>
-  </header>
-  <main>
-    <h1>Returning basket to procurement</h1>
-    <p>The supplier site is posting the PunchOutOrderMessage back to the original BrowserFormPost URL.</p>
-    <form method="post" action="' . h($returnUrl) . '">
-      <input type="hidden" name="cXML-urlencoded" value="' . h($cxml) . '">
-      <button type="submit">Continue</button>
-    </form>
-  </main>
-  <script>document.forms[0].submit();</script>
-</body>
-</html>';
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -1048,7 +809,7 @@ if ($method === 'GET' && $path === '/') {
 }
 
 if ($method === 'GET' && $path === '/admin') {
-    sendHtml(adminPage($state['erp_config'], $state['supplier_config'], (string) ($_GET['saved'] ?? '')));
+    sendHtml(adminPage($state['erp_config'], $state['webstore_config'], (string) ($_GET['saved'] ?? '')));
     return;
 }
 
@@ -1058,6 +819,8 @@ if ($method === 'POST' && $path === '/admin/erp') {
         'supplier_identity' => trim((string) ($_POST['supplier_identity'] ?? '')),
         'sender_identity' => trim((string) ($_POST['sender_identity'] ?? '')),
         'shared_secret' => trim((string) ($_POST['shared_secret'] ?? '')),
+        'user_name' => trim((string) ($_POST['user_name'] ?? '')),
+        'user_email' => trim((string) ($_POST['user_email'] ?? '')),
         'browser_form_post_url' => trim((string) ($_POST['browser_form_post_url'] ?? '')) ?: $baseUrl . '/procurement/return',
     ];
     saveState($statePath, $state);
@@ -1065,54 +828,50 @@ if ($method === 'POST' && $path === '/admin/erp') {
     return;
 }
 
-if ($method === 'POST' && $path === '/admin/supplier') {
-    $state['supplier_config'] = [
-        'expected_buyer_identity' => trim((string) ($_POST['expected_buyer_identity'] ?? '')),
-        'supplier_identity' => trim((string) ($_POST['supplier_identity'] ?? '')),
-        'expected_sender_identity' => trim((string) ($_POST['expected_sender_identity'] ?? '')),
-        'shared_secret' => trim((string) ($_POST['shared_secret'] ?? '')),
+if ($method === 'POST' && $path === '/admin/webstore') {
+    $state['webstore_config'] = [
+        'supplier_webstore_url' => trim((string) ($_POST['supplier_webstore_url'] ?? '')),
+        'punchout_setup_url' => trim((string) ($_POST['punchout_setup_url'] ?? '')),
+        'order_request_url' => trim((string) ($_POST['order_request_url'] ?? '')),
+        'request_timeout_seconds' => max(1, (int) ($_POST['request_timeout_seconds'] ?? 15)),
     ];
     saveState($statePath, $state);
-    redirectTo('/admin?saved=Supplier setup values updated');
+    redirectTo('/admin?saved=Webstore endpoints updated');
     return;
 }
 
 if ($method === 'POST' && $path === '/admin/reset') {
     $state['erp_config'] = [
         'buyer_identity' => 'DEMO_BUYER',
-        'supplier_identity' => 'MOCK_SUPPLIER',
+        'supplier_identity' => 'REAL_WEBSTORE',
         'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
         'shared_secret' => 'topsecret',
+        'user_name' => 'Jamie Buyer',
+        'user_email' => 'buyer@example.test',
         'browser_form_post_url' => $baseUrl . '/procurement/return',
     ];
-    $state['supplier_config'] = [
-        'expected_buyer_identity' => 'DEMO_BUYER',
-        'supplier_identity' => 'MOCK_SUPPLIER',
-        'expected_sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
-        'shared_secret' => 'topsecret',
+    $state['webstore_config'] = [
+        'supplier_webstore_url' => getenv('SUPPLIER_WEBSTORE_URL') ?: '',
+        'punchout_setup_url' => getenv('WEBSTORE_PUNCHOUT_SETUP_URL') ?: '',
+        'order_request_url' => getenv('WEBSTORE_ORDER_REQUEST_URL') ?: '',
+        'request_timeout_seconds' => 15,
     ];
-    $state['punchout_sessions'] = [];
     $state['returned_orders'] = [];
-    $state['supplier_orders'] = [];
     saveState($statePath, $state);
-    redirectTo('/admin?saved=Demo credentials reset');
+    redirectTo('/admin?saved=ERP defaults reset');
     return;
 }
 
 if ($method === 'POST' && $path === '/procurement/punchout') {
     $product = findProduct($products, (string) ($_POST['sku'] ?? 'SKU-001'));
     $setupXml = setupRequestXml($product, $state['erp_config']);
-    $result = createPunchoutSessionFromXml($setupXml, $baseUrl, $state['supplier_config'], $state);
-    saveState($statePath, $state);
+    $webstoreConfig = effectiveWebstoreConfig($state['webstore_config']);
+    $result = postCxml(
+        (string) ($webstoreConfig['punchout_setup_url'] ?? ''),
+        $setupXml,
+        (int) ($webstoreConfig['request_timeout_seconds'] ?? 15)
+    );
     sendHtml(setupExchangePage($setupXml, $result));
-    return;
-}
-
-if ($method === 'POST' && $path === '/cxml/punchout/setup') {
-    $xml = file_get_contents('php://input') ?: '';
-    $result = createPunchoutSessionFromXml($xml, $baseUrl, $state['supplier_config'], $state);
-    saveState($statePath, $state);
-    sendXml($result['xml'], $result['status']);
     return;
 }
 
@@ -1137,11 +896,18 @@ if ($method === 'POST' && preg_match('#^/procurement/orders/([a-f0-9-]+)/approve
         }
 
         $orderRequestXml = orderRequestXml($returnedOrder, $state['erp_config']);
-        $supplierResponse = receiveSupplierOrderRequest($orderRequestXml, $state['supplier_config'], $state);
+        $webstoreConfig = effectiveWebstoreConfig($state['webstore_config']);
+        $supplierResponse = postCxml(
+            (string) ($webstoreConfig['order_request_url'] ?? ''),
+            $orderRequestXml,
+            (int) ($webstoreConfig['request_timeout_seconds'] ?? 15)
+        );
         $state['returned_orders'][$index]['status'] = $supplierResponse['ok'] ? 'approved and sent' : 'approval send failed';
         $state['returned_orders'][$index]['order_request_cxml'] = $orderRequestXml;
-        $state['returned_orders'][$index]['supplier_response_cxml'] = $supplierResponse['xml'];
+        $state['returned_orders'][$index]['supplier_response_cxml'] = $supplierResponse['body'];
         $state['returned_orders'][$index]['supplier_response_ok'] = $supplierResponse['ok'];
+        $state['returned_orders'][$index]['supplier_response_status'] = $supplierResponse['status'];
+        $state['returned_orders'][$index]['supplier_response_error'] = $supplierResponse['error'];
         saveState($statePath, $state);
 
         sendHtml(orderApprovalPage($state['returned_orders'][$index]));
@@ -1150,83 +916,6 @@ if ($method === 'POST' && preg_match('#^/procurement/orders/([a-f0-9-]+)/approve
 
     http_response_code(404);
     echo 'Returned order not found';
-    return;
-}
-
-if ($method === 'GET' && $path === '/supplier/orders') {
-    sendHtml(supplierOrdersPage($state), 'supplier');
-    return;
-}
-
-if ($method === 'POST' && $path === '/supplier/cxml/order') {
-    $xml = file_get_contents('php://input') ?: '';
-    $result = receiveSupplierOrderRequest($xml, $state['supplier_config'], $state);
-    saveState($statePath, $state);
-    sendXml($result['xml'], $result['status']);
-    return;
-}
-
-if ($method === 'GET' && preg_match('#^/supplier/start/([a-f0-9-]+)$#', $path, $matches)) {
-    if (!isset($state['punchout_sessions'][$matches[1]])) {
-        http_response_code(404);
-        echo 'Session not found';
-        return;
-    }
-
-    redirectTo('/supplier/session/' . $matches[1]);
-    return;
-}
-
-if ($method === 'GET' && preg_match('#^/supplier/session/([a-f0-9-]+)$#', $path, $matches)) {
-    $session = $state['punchout_sessions'][$matches[1]] ?? null;
-    if (!$session) {
-        http_response_code(404);
-        echo 'Session not found';
-        return;
-    }
-
-    sendHtml(storefront($session, $products), 'supplier');
-    return;
-}
-
-if ($method === 'POST' && preg_match('#^/supplier/session/([a-f0-9-]+)/basket/add$#', $path, $matches)) {
-    $sessionId = $matches[1];
-    if (!isset($state['punchout_sessions'][$sessionId])) {
-        http_response_code(404);
-        echo 'Session not found';
-        return;
-    }
-
-    $sku = (string) ($_POST['sku'] ?? '');
-    $quantity = max(1, (int) ($_POST['quantity'] ?? 1));
-    $basket = &$state['punchout_sessions'][$sessionId]['basket'];
-    foreach ($basket as &$line) {
-        if ($line['sku'] === $sku) {
-            $line['quantity'] += $quantity;
-            unset($line);
-            saveState($statePath, $state);
-            redirectTo('/supplier/session/' . $sessionId);
-            return;
-        }
-    }
-    unset($line);
-
-    $basket[] = ['sku' => $sku, 'quantity' => $quantity];
-    saveState($statePath, $state);
-    redirectTo('/supplier/session/' . $sessionId);
-    return;
-}
-
-if ($method === 'POST' && preg_match('#^/supplier/session/([a-f0-9-]+)/return$#', $path, $matches)) {
-    $session = $state['punchout_sessions'][$matches[1]] ?? null;
-    if (!$session) {
-        http_response_code(404);
-        echo 'Session not found';
-        return;
-    }
-
-    header('Content-Type: text/html; charset=utf-8');
-    echo autoPostPage($session['browser_form_post_url'], orderMessageXml($session, $products));
     return;
 }
 

@@ -1,12 +1,8 @@
-# PunchOut Example
+# PunchOut ERP Test Harness
 
-That is the smallest useful cXML PunchOut Level 2 implementation path for customer sign-in, basket creation and basket return.
+This branch is the ERP/procurement side of a cXML PunchOut flow. It no longer includes a mock supplier storefront. Instead, it generates ERP cXML, posts it to configurable webstore endpoints, accepts returned baskets, and sends approved purchase orders back to the configured webstore.
 
-## Runnable mock flow
-
-This repo includes a dependency-free PHP mock so devs can see the flow in a browser.
-
-Start it with:
+## Run locally
 
 ```bash
 php -S localhost:8000 index.php
@@ -18,80 +14,80 @@ Then open:
 http://localhost:8000
 ```
 
-The mock demonstrates:
+Runtime state is stored in `mock-state.json`.
 
-1. A procurement search page with Level 2 product results.
-2. A generated `PunchOutSetupRequest` containing `BuyerCookie`, `BrowserFormPost`, shared secret, and `SelectedItem`.
-3. A supplier `/cxml/punchout/setup` endpoint that authenticates the request and returns a `PunchOutSetupResponse` with a `StartPage` URL.
-4. A mock supplier storefront that auto-signs in the buyer and lands on the selected item.
-5. PunchOut basket building with normal checkout replaced by a return-basket action.
-6. A generated `PunchOutOrderMessage`.
-7. Auto-posting the basket back to the procurement `BrowserFormPost` URL.
-8. A procurement return page that displays the received cXML as a pending requisition.
-9. ERP approval that converts the returned basket into a cXML `OrderRequest`.
-10. A supplier order endpoint/inbox that receives the approved order from the ERP.
+## Flow
 
-Mock session and basket state is stored in a local `mock-state.json` file for this demo.
+1. The ERP search page shows Level 2 product results.
+2. Clicking a result generates a `PunchOutSetupRequest` with `BuyerCookie`, `BrowserFormPost`, shared secret, and `SelectedItem`.
+3. The ERP posts that cXML to the configured webstore PunchOut setup URL.
+4. The webstore should respond with a `PunchOutSetupResponse` containing a `StartPage` URL.
+5. The ERP displays the request, response, HTTP status, and an action to open the returned `StartPage`.
+6. The buyer completes the PunchOut session in the real webstore.
+7. The webstore posts a `PunchOutOrderMessage` back to the ERP `BrowserFormPost` URL.
+8. The ERP shows the returned basket as a pending requisition.
+9. Approval converts the basket into a cXML `OrderRequest`.
+10. The ERP posts the approved `OrderRequest` to the configured webstore order URL and displays the response.
 
-When using ngrok, post external tester requests to:
+## Setup Admin
 
-```text
-https://your-ngrok-host/cxml/punchout/setup
-```
-
-The mock derives its `StartPage` URL from the incoming request host, so a request through ngrok should return:
-
-```text
-https://your-ngrok-host/supplier/start/...
-```
-
-Do not set `BASE_URL=http://localhost:8000` when testing through ngrok. If `BASE_URL` is set, it overrides automatic host detection.
-
-Runtime mock state is stored in `mock-state.json` so server-to-server cXML setup requests and browser redirects can share the same PunchOut session.
-
-### Mock setup admin
-
-Open the setup admin at:
+Open:
 
 ```text
 http://localhost:8000/admin
 ```
 
-The admin screen has two sides:
+Configure:
 
-1. ERP setup values: what the procurement system writes into the outgoing `PunchOutSetupRequest`.
-2. Supplier expected values: what the storefront requires before it creates a PunchOut session.
+- ERP identities sent in cXML: buyer identity, supplier identity, sender identity, and shared secret.
+- End user name and end user email. These are sent in the `PunchOutSetupRequest` as `Contact role="endUser"`:
 
-The demo setup succeeds only when these values match:
-
-1. ERP `From` identity matches supplier expected buyer identity.
-2. ERP `To` identity matches supplier identity.
-3. ERP `Sender` identity matches supplier expected sender identity.
-4. ERP shared secret matches supplier shared secret.
-
-Change one side only, then try to punch out from a product. The supplier returns `401 Unauthorized` and no `StartPage` URL. Set both sides back to matching values, or use the reset button, and the flow works again.
-
-### Mock approval flow
-
-After the basket is returned to the ERP, the return page shows an approval action.
-
-Click:
-
-```text
-Approve and send PO to supplier
+```xml
+<Contact role="endUser">
+  <Name xml:lang="en">Jamie Buyer</Name>
+  <Email>buyer@example.com</Email>
+</Contact>
 ```
 
-The ERP then:
+- `BrowserFormPost` return URL: the URL the webstore posts the basket back to.
+- Supplier webstore base URL, for example `https://store.example.test`.
+- Optional webstore endpoint overrides if your routes differ from `/cxml/punchout/setup` and `/cxml/order`.
+- HTTP request timeout.
 
-1. Reads the returned `PunchOutOrderMessage`.
-2. Creates an approved purchase order as cXML `OrderRequest`.
-3. Sends that order message to the supplier side.
-4. Shows the supplier's cXML response.
-
-The supplier-side inbox is available at:
+With only the supplier webstore base URL set, the ERP posts to:
 
 ```text
-http://localhost:8000/supplier/orders
+https://store.example.test/cxml/punchout/setup
+https://store.example.test/cxml/order
 ```
 
-That page shows the approved `OrderRequest` messages the mock supplier has received.
+The webstore owns credential validation. If setup fails, the ERP page shows the HTTP status and response body returned by the webstore.
+
+## Ngrok / Public Testing
+
+When the webstore cannot reach your local machine directly, expose this ERP harness and set the admin `BrowserFormPost` URL to:
+
+```text
+https://your-ngrok-host/procurement/return
+```
+
+If this app itself is behind ngrok, you can also start it without `BASE_URL`; it derives local return defaults from the incoming host. Set `BASE_URL` only when you need to force generated local URLs.
+
+## Environment Defaults
+
+You can prefill webstore settings with environment variables:
+
+```bash
+SUPPLIER_WEBSTORE_URL=https://store.example.test \
+php -S localhost:8000 index.php
+```
+
+If your webstore uses different paths, use explicit endpoints:
+
+```bash
+WEBSTORE_PUNCHOUT_SETUP_URL=https://store.example.test/custom/setup \
+WEBSTORE_ORDER_REQUEST_URL=https://store.example.test/custom/order \
+php -S localhost:8000 index.php
+```
+
+Values saved in the admin UI are persisted to `mock-state.json`.
