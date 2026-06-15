@@ -62,13 +62,32 @@ function defaultState(string $baseUrl): array
     return [
         'returned_orders' => [],
         'erp_config' => [
+            'from_domain' => 'NetworkId',
             'buyer_identity' => 'DEMO_BUYER',
+            'to_domain' => 'DUNS',
             'supplier_identity' => 'REAL_WEBSTORE',
+            'sender_domain' => 'NetworkId',
             'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
             'shared_secret' => 'topsecret',
+            'deployment_mode' => 'production',
+            'user_agent' => 'PunchOut ERP Test Harness',
+            'username' => 'jdoe12345',
+            'user_id' => '12345',
             'user_name' => 'Jamie Buyer',
+            'user_first_name' => 'Jamie',
+            'user_last_name' => 'Buyer',
             'user_email' => 'buyer@example.test',
+            'user_phone' => '555-555-5555',
             'browser_form_post_url' => $baseUrl . '/procurement/return',
+            'supplier_setup_url' => '',
+            'ship_to_address_id' => 'TEST',
+            'ship_to_name' => 'TEST',
+            'ship_to_street' => '123 Street Address',
+            'ship_to_city' => 'Rockville',
+            'ship_to_state' => 'MD',
+            'ship_to_postal_code' => '20850',
+            'ship_to_country' => 'US',
+            'ship_to_country_code' => 'US',
         ],
         'webstore_config' => [
             'supplier_webstore_url' => getenv('SUPPLIER_WEBSTORE_URL') ?: '',
@@ -112,6 +131,27 @@ function x(string|int|float|null $value): string
 function money(float $value): string
 {
     return number_format($value, 2, '.', '');
+}
+
+function configValue(array $config, string $key, string $default = ''): string
+{
+    $value = trim((string) ($config[$key] ?? ''));
+
+    return $value === '' ? $default : $value;
+}
+
+function namePart(array $config, string $part): string
+{
+    $fullName = configValue($config, 'user_name');
+    $pieces = preg_split('/\s+/', $fullName) ?: [];
+
+    if ($part === 'first') {
+        return configValue($config, 'user_first_name', $pieces[0] ?? '');
+    }
+
+    $derivedLast = count($pieces) > 1 ? implode(' ', array_slice($pieces, 1)) : '';
+
+    return configValue($config, 'user_last_name', $derivedLast);
 }
 
 function uuid(): string
@@ -420,38 +460,66 @@ function setupRequestXml(array $product, array $erpConfig): string
     $payloadId = time() . '.' . uuid() . '@mock-procurement';
     $buyerCookie = 'BUYER-' . uuid();
     $returnUrl = $erpConfig['browser_form_post_url'];
+    $username = configValue($erpConfig, 'username', configValue($erpConfig, 'user_email'));
+    $fullName = configValue($erpConfig, 'user_name');
+    $firstName = namePart($erpConfig, 'first');
+    $lastName = namePart($erpConfig, 'last');
 
     return '<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.064/cXML.dtd">
+<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.041/cXML.dtd">
 <cXML payloadID="' . x($payloadId) . '" timestamp="' . x(date(DATE_ATOM)) . '">
   <Header>
     <From>
-      <Credential domain="NetworkId">
+      <Credential domain="' . x(configValue($erpConfig, 'from_domain', 'NetworkId')) . '">
         <Identity>' . x($erpConfig['buyer_identity']) . '</Identity>
       </Credential>
     </From>
     <To>
-      <Credential domain="NetworkId">
+      <Credential domain="' . x(configValue($erpConfig, 'to_domain', 'DUNS')) . '">
         <Identity>' . x($erpConfig['supplier_identity']) . '</Identity>
       </Credential>
     </To>
     <Sender>
-      <Credential domain="NetworkId">
+      <Credential domain="' . x(configValue($erpConfig, 'sender_domain', 'NetworkId')) . '">
         <Identity>' . x($erpConfig['sender_identity']) . '</Identity>
         <SharedSecret>' . x($erpConfig['shared_secret']) . '</SharedSecret>
       </Credential>
-      <UserAgent>Mock Procurement Harness</UserAgent>
+      <UserAgent>' . x(configValue($erpConfig, 'user_agent', 'PunchOut ERP Test Harness')) . '</UserAgent>
     </Sender>
   </Header>
-  <Request deploymentMode="test">
+  <Request deploymentMode="' . x(configValue($erpConfig, 'deployment_mode', 'production')) . '">
     <PunchOutSetupRequest operation="create">
       <BuyerCookie>' . x($buyerCookie) . '</BuyerCookie>
+      <Extrinsic name="User">' . x($username) . '</Extrinsic>
+      <Extrinsic name="UniqueUsername">' . x($username) . '</Extrinsic>
+      <Extrinsic name="UserId">' . x(configValue($erpConfig, 'user_id')) . '</Extrinsic>
+      <Extrinsic name="UserEmail">' . x(configValue($erpConfig, 'user_email')) . '</Extrinsic>
+      <Extrinsic name="UserFullName">' . x($fullName) . '</Extrinsic>
+      <Extrinsic name="UserPrintableName">' . x($fullName) . '</Extrinsic>
+      <Extrinsic name="FirstName">' . x($firstName) . '</Extrinsic>
+      <Extrinsic name="LastName">' . x($lastName) . '</Extrinsic>
+      <Extrinsic name="PhoneNumber">' . x(configValue($erpConfig, 'user_phone')) . '</Extrinsic>
       <BrowserFormPost>
         <URL>' . x($returnUrl) . '</URL>
       </BrowserFormPost>
+      <SupplierSetup>
+        <URL>' . x(configValue($erpConfig, 'supplier_setup_url')) . '</URL>
+      </SupplierSetup>
+      <ShipTo>
+        <Address addressID="' . x(configValue($erpConfig, 'ship_to_address_id', 'TEST')) . '">
+          <Name xml:lang="en">' . x(configValue($erpConfig, 'ship_to_name', 'TEST')) . '</Name>
+          <PostalAddress>
+            <Street>' . x(configValue($erpConfig, 'ship_to_street')) . '</Street>
+            <City>' . x(configValue($erpConfig, 'ship_to_city')) . '</City>
+            <State>' . x(configValue($erpConfig, 'ship_to_state')) . '</State>
+            <PostalCode>' . x(configValue($erpConfig, 'ship_to_postal_code')) . '</PostalCode>
+            <Country isoCountryCode="' . x(configValue($erpConfig, 'ship_to_country_code', 'US')) . '">' . x(configValue($erpConfig, 'ship_to_country', 'US')) . '</Country>
+          </PostalAddress>
+        </Address>
+      </ShipTo>
       <Contact role="endUser">
-        <Name xml:lang="en">' . x($erpConfig['user_name'] ?? '') . '</Name>
-        <Email>' . x($erpConfig['user_email'] ?? '') . '</Email>
+        <Name xml:lang="en">' . x($fullName) . '</Name>
+        <Email>' . x(configValue($erpConfig, 'user_email')) . '</Email>
       </Contact>
       <SelectedItem>
         <ItemID>
@@ -644,11 +712,20 @@ function adminPage(array $erpConfig, array $webstoreConfig, string $message = ''
           <h2>ERP setup values</h2>
           <p>These are written into the outgoing PunchOutSetupRequest.</p>
           <form method="post" action="/admin/erp" class="form-grid">
+            <label>From credential domain
+              <input type="text" name="from_domain" value="' . h($erpConfig['from_domain'] ?? 'NetworkId') . '">
+            </label>
             <label>From Identity / buyer
               <input type="text" name="buyer_identity" value="' . h($erpConfig['buyer_identity']) . '">
             </label>
+            <label>To credential domain
+              <input type="text" name="to_domain" value="' . h($erpConfig['to_domain'] ?? 'DUNS') . '">
+            </label>
             <label>To Identity / supplier
               <input type="text" name="supplier_identity" value="' . h($erpConfig['supplier_identity']) . '">
+            </label>
+            <label>Sender credential domain
+              <input type="text" name="sender_domain" value="' . h($erpConfig['sender_domain'] ?? 'NetworkId') . '">
             </label>
             <label>Sender Identity / ERP system
               <input type="text" name="sender_identity" value="' . h($erpConfig['sender_identity']) . '">
@@ -656,14 +733,62 @@ function adminPage(array $erpConfig, array $webstoreConfig, string $message = ''
             <label>Shared secret sent by ERP
               <input type="text" name="shared_secret" value="' . h($erpConfig['shared_secret']) . '">
             </label>
+            <label>Deployment mode
+              <input type="text" name="deployment_mode" value="' . h($erpConfig['deployment_mode'] ?? 'production') . '">
+            </label>
+            <label>UserAgent
+              <input type="text" name="user_agent" value="' . h($erpConfig['user_agent'] ?? 'PunchOut ERP Test Harness') . '">
+            </label>
+            <label>Username / UniqueUsername
+              <input type="text" name="username" value="' . h($erpConfig['username'] ?? '') . '">
+            </label>
+            <label>User ID
+              <input type="text" name="user_id" value="' . h($erpConfig['user_id'] ?? '') . '">
+            </label>
             <label>End user name
               <input type="text" name="user_name" value="' . h($erpConfig['user_name'] ?? '') . '">
+            </label>
+            <label>First name
+              <input type="text" name="user_first_name" value="' . h($erpConfig['user_first_name'] ?? '') . '">
+            </label>
+            <label>Last name
+              <input type="text" name="user_last_name" value="' . h($erpConfig['user_last_name'] ?? '') . '">
             </label>
             <label>End user email
               <input type="email" name="user_email" value="' . h($erpConfig['user_email'] ?? '') . '" placeholder="buyer@example.com">
             </label>
+            <label>Phone number
+              <input type="text" name="user_phone" value="' . h($erpConfig['user_phone'] ?? '') . '">
+            </label>
             <label>BrowserFormPost return URL
               <input type="url" name="browser_form_post_url" value="' . h($erpConfig['browser_form_post_url']) . '">
+            </label>
+            <label>SupplierSetup URL
+              <input type="url" name="supplier_setup_url" value="' . h($erpConfig['supplier_setup_url'] ?? '') . '">
+            </label>
+            <label>ShipTo address ID
+              <input type="text" name="ship_to_address_id" value="' . h($erpConfig['ship_to_address_id'] ?? '') . '">
+            </label>
+            <label>ShipTo name
+              <input type="text" name="ship_to_name" value="' . h($erpConfig['ship_to_name'] ?? '') . '">
+            </label>
+            <label>ShipTo street
+              <input type="text" name="ship_to_street" value="' . h($erpConfig['ship_to_street'] ?? '') . '">
+            </label>
+            <label>ShipTo city
+              <input type="text" name="ship_to_city" value="' . h($erpConfig['ship_to_city'] ?? '') . '">
+            </label>
+            <label>ShipTo state
+              <input type="text" name="ship_to_state" value="' . h($erpConfig['ship_to_state'] ?? '') . '">
+            </label>
+            <label>ShipTo postal code
+              <input type="text" name="ship_to_postal_code" value="' . h($erpConfig['ship_to_postal_code'] ?? '') . '">
+            </label>
+            <label>ShipTo country
+              <input type="text" name="ship_to_country" value="' . h($erpConfig['ship_to_country'] ?? '') . '">
+            </label>
+            <label>ShipTo country code
+              <input type="text" name="ship_to_country_code" value="' . h($erpConfig['ship_to_country_code'] ?? '') . '">
             </label>
             <button type="submit">Save ERP values</button>
           </form>
@@ -815,13 +940,32 @@ if ($method === 'GET' && $path === '/admin') {
 
 if ($method === 'POST' && $path === '/admin/erp') {
     $state['erp_config'] = [
+        'from_domain' => trim((string) ($_POST['from_domain'] ?? 'NetworkId')),
         'buyer_identity' => trim((string) ($_POST['buyer_identity'] ?? '')),
+        'to_domain' => trim((string) ($_POST['to_domain'] ?? 'DUNS')),
         'supplier_identity' => trim((string) ($_POST['supplier_identity'] ?? '')),
+        'sender_domain' => trim((string) ($_POST['sender_domain'] ?? 'NetworkId')),
         'sender_identity' => trim((string) ($_POST['sender_identity'] ?? '')),
         'shared_secret' => trim((string) ($_POST['shared_secret'] ?? '')),
+        'deployment_mode' => trim((string) ($_POST['deployment_mode'] ?? 'production')) ?: 'production',
+        'user_agent' => trim((string) ($_POST['user_agent'] ?? 'PunchOut ERP Test Harness')) ?: 'PunchOut ERP Test Harness',
+        'username' => trim((string) ($_POST['username'] ?? '')),
+        'user_id' => trim((string) ($_POST['user_id'] ?? '')),
         'user_name' => trim((string) ($_POST['user_name'] ?? '')),
+        'user_first_name' => trim((string) ($_POST['user_first_name'] ?? '')),
+        'user_last_name' => trim((string) ($_POST['user_last_name'] ?? '')),
         'user_email' => trim((string) ($_POST['user_email'] ?? '')),
+        'user_phone' => trim((string) ($_POST['user_phone'] ?? '')),
         'browser_form_post_url' => trim((string) ($_POST['browser_form_post_url'] ?? '')) ?: $baseUrl . '/procurement/return',
+        'supplier_setup_url' => trim((string) ($_POST['supplier_setup_url'] ?? '')),
+        'ship_to_address_id' => trim((string) ($_POST['ship_to_address_id'] ?? '')),
+        'ship_to_name' => trim((string) ($_POST['ship_to_name'] ?? '')),
+        'ship_to_street' => trim((string) ($_POST['ship_to_street'] ?? '')),
+        'ship_to_city' => trim((string) ($_POST['ship_to_city'] ?? '')),
+        'ship_to_state' => trim((string) ($_POST['ship_to_state'] ?? '')),
+        'ship_to_postal_code' => trim((string) ($_POST['ship_to_postal_code'] ?? '')),
+        'ship_to_country' => trim((string) ($_POST['ship_to_country'] ?? '')),
+        'ship_to_country_code' => trim((string) ($_POST['ship_to_country_code'] ?? '')),
     ];
     saveState($statePath, $state);
     redirectTo('/admin?saved=ERP setup values updated');
@@ -842,13 +986,32 @@ if ($method === 'POST' && $path === '/admin/webstore') {
 
 if ($method === 'POST' && $path === '/admin/reset') {
     $state['erp_config'] = [
+        'from_domain' => 'NetworkId',
         'buyer_identity' => 'DEMO_BUYER',
+        'to_domain' => 'DUNS',
         'supplier_identity' => 'REAL_WEBSTORE',
+        'sender_domain' => 'NetworkId',
         'sender_identity' => 'DEMO_PROCUREMENT_SYSTEM',
         'shared_secret' => 'topsecret',
+        'deployment_mode' => 'production',
+        'user_agent' => 'PunchOut ERP Test Harness',
+        'username' => 'jdoe12345',
+        'user_id' => '12345',
         'user_name' => 'Jamie Buyer',
+        'user_first_name' => 'Jamie',
+        'user_last_name' => 'Buyer',
         'user_email' => 'buyer@example.test',
+        'user_phone' => '555-555-5555',
         'browser_form_post_url' => $baseUrl . '/procurement/return',
+        'supplier_setup_url' => '',
+        'ship_to_address_id' => 'TEST',
+        'ship_to_name' => 'TEST',
+        'ship_to_street' => '123 Street Address',
+        'ship_to_city' => 'Rockville',
+        'ship_to_state' => 'MD',
+        'ship_to_postal_code' => '20850',
+        'ship_to_country' => 'US',
+        'ship_to_country_code' => 'US',
     ];
     $state['webstore_config'] = [
         'supplier_webstore_url' => getenv('SUPPLIER_WEBSTORE_URL') ?: '',

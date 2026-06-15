@@ -39,8 +39,23 @@ http://localhost:8000/admin
 
 Configure:
 
-- ERP identities sent in cXML: buyer identity, supplier identity, sender identity, and shared secret.
-- End user name and end user email. These are sent in the `PunchOutSetupRequest` as `Contact role="endUser"`:
+- ERP identities sent in cXML: buyer identity, supplier identity, sender identity, shared secret, and credential domains.
+- Deployment mode and UserAgent.
+- End user username, ID, name, first name, last name, email, and phone number. These are sent as `PunchOutSetupRequest` extrinsics:
+
+```xml
+<Extrinsic name="User">jdoe12345</Extrinsic>
+<Extrinsic name="UniqueUsername">jdoe12345</Extrinsic>
+<Extrinsic name="UserId">12345</Extrinsic>
+<Extrinsic name="UserEmail">jdoe@example.com</Extrinsic>
+<Extrinsic name="UserFullName">John Doe</Extrinsic>
+<Extrinsic name="UserPrintableName">John Doe</Extrinsic>
+<Extrinsic name="FirstName">John</Extrinsic>
+<Extrinsic name="LastName">Doe</Extrinsic>
+<Extrinsic name="PhoneNumber">555-555-5555</Extrinsic>
+```
+
+The same user name and email are also sent in the `Contact role="endUser"` block:
 
 ```xml
 <Contact role="endUser">
@@ -50,6 +65,7 @@ Configure:
 ```
 
 - `BrowserFormPost` return URL: the URL the webstore posts the basket back to.
+- Optional `SupplierSetup` URL and `ShipTo` address.
 - Supplier webstore base URL, for example `https://store.example.test`.
 - Optional webstore endpoint overrides if your routes differ from `/cxml/punchout/setup` and `/cxml/order`.
 - HTTP request timeout.
