@@ -536,6 +536,28 @@ function parseStartUrl(string $responseXml): string
     return firstXmlValue($responseXml, '//PunchOutSetupResponse/StartPage/URL');
 }
 
+function setupResponseXml(string $incomingCxml, string $startPageUrl): string
+{
+    $buyerCookie = firstXmlValue($incomingCxml, '//PunchOutSetupRequest/BuyerCookie');
+    $payloadId = time() . '.' . uuid() . '@mock-webstore';
+
+    return '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cXML SYSTEM "http://xml.cxml.org/schemas/cXML/1.2.041/cXML.dtd">
+<cXML payloadID="' . x($payloadId) . '" timestamp="' . x(date(DATE_ATOM)) . '">
+  <Response>
+    <Status code="200" text="OK">Success</Status>
+    <PunchOutSetupResponse>
+      <BuyerCookie>' . x($buyerCookie) . '</BuyerCookie>
+      <StartPage>
+        <URL>' . x($startPageUrl) . '</URL>
+      </StartPage>
+    </PunchOutSetupResponse>
+  </Response>
+</cXML>';
+}
+
+
+
 function punchoutOrderLines(string $cxml): array
 {
     $doc = loadXml($cxml);
@@ -599,17 +621,17 @@ function orderRequestXml(array $returnedOrder, array $erpConfig): string
 <cXML payloadID="' . x(uuid() . '@mock-procurement') . '" timestamp="' . x(date(DATE_ATOM)) . '">
   <Header>
     <From>
-      <Credential domain="NetworkId">
+      <Credential domain="' . x(configValue($erpConfig, 'from_domain', 'NetworkId')) . '">
         <Identity>' . x($erpConfig['buyer_identity']) . '</Identity>
       </Credential>
     </From>
     <To>
-      <Credential domain="NetworkId">
+      <Credential domain="' . x(configValue($erpConfig, 'to_domain', 'DUNS')) . '">
         <Identity>' . x($erpConfig['supplier_identity']) . '</Identity>
       </Credential>
     </To>
     <Sender>
-      <Credential domain="NetworkId">
+      <Credential domain="' . x(configValue($erpConfig, 'sender_domain', 'NetworkId')) . '">
         <Identity>' . x($erpConfig['sender_identity']) . '</Identity>
         <SharedSecret>' . x($erpConfig['shared_secret']) . '</SharedSecret>
       </Credential>
@@ -925,6 +947,44 @@ function orderApprovalPage(array $returnedOrder): string
     </div>';
 }
 
+function supplierHome(array $products): string
+{
+    $cards = '';
+    foreach ($products as $product) {
+        $cards .= '
+    <div class="card">
+      <div class="swatch" style="background:' . h($product['accent']) . '"></div>
+      <div>
+        <h3><a href="/supplier/product/' . h(urlencode($product['sku'])) . '">' . h($product['name']) . '</a></h3>
+        <div class="meta">' . h($product['category']) . ' &middot; ' . h($product['sku']) . '</div>
+      </div>
+      <p>' . h($product['description']) . '</p>
+      <div class="price">' . h($product['currency']) . ' ' . money($product['price']) . '</div>
+    </div>';
+    }
+
+    return '
+    <div>
+      <h1>Supplier shop</h1>
+      <p>Browse products below.</p>
+      <div class="products">' . $cards . '</div>
+    </div>';
+}
+
+function supplierProductPage(array $product): string
+{
+    return '
+    <div>
+      <h1>' . h($product['name']) . '</h1>
+      <div class="swatch" style="background:' . h($product['accent']) . '"></div>
+      <p>' . h($product['description']) . '</p>
+      <div class="meta">' . h($product['category']) . ' &middot; ' . h($product['sku']) . '</div>
+      <div class="price">' . h($product['currency']) . ' ' . money($product['price']) . '</div>
+      <p><strong>SKU:</strong> ' . h($product['sku']) . '</p>
+      <a class="button secondary" href="/supplier">Back to supplier shop</a>
+    </div>';
+}
+
 $method = $_SERVER['REQUEST_METHOD'];
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 
@@ -1079,6 +1139,29 @@ if ($method === 'POST' && preg_match('#^/procurement/orders/([a-f0-9-]+)/approve
 
     http_response_code(404);
     echo 'Returned order not found';
+    return;
+}
+
+if ($method === 'GET' && $path === '/supplier') {
+    sendHtml(supplierHome($products), 'supplier');
+    return;
+}
+
+if ($method === 'GET' && preg_match('#^/supplier/product/(.+)$#', $path, $matches)) {
+    $sku = urldecode($matches[1]);
+    $product = findProduct($products, $sku);
+    sendHtml(supplierProductPage($product), 'supplier');
+    return;
+}
+
+if ($method === 'POST' && $path === '/cxml/punchout/setup') {
+    $body = (string) file_get_contents('php://input');
+    $supplierPartId = firstXmlValue($body, '//PunchOutSetupRequest/SelectedItem/ItemID/SupplierPartID');
+    $startPageUrl = $supplierPartId !== ''
+        ? $baseUrl . '/supplier/product/' . urlencode($supplierPartId)
+        : $baseUrl . '/supplier';
+    header('Content-Type: text/xml; charset=utf-8');
+    echo setupResponseXml($body, $startPageUrl);
     return;
 }
 
